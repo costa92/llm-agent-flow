@@ -20,8 +20,11 @@ import (
 	"os"
 	"strings"
 
+	agents "github.com/costa92/llm-agent"
 	"github.com/costa92/llm-agent-flow/examples/echo_chain"
+	"github.com/costa92/llm-agent-flow/examples/router"
 	"github.com/costa92/llm-agent-flow/flow"
+	cond "github.com/costa92/llm-agent-flow/flow/cond/cel"
 	toolspkg "github.com/costa92/llm-agent-flow/flow/tools"
 )
 
@@ -105,7 +108,12 @@ func cmdRun(args []string) error {
 	if err := flow.RegisterToolNode(reg); err != nil {
 		return fmt.Errorf("flow run: register tool node: %w", err)
 	}
-	engine, err := flow.LoadCompile(f, reg, flow.Deps{Tools: tools})
+	celEval, err := cond.NewEvaluator()
+	if err != nil {
+		return fmt.Errorf("flow run: cel evaluator: %w", err)
+	}
+	engine, err := flow.LoadCompile(f, reg, flow.Deps{Tools: tools},
+		flow.WithConditionEvaluator(celEval))
 	if err != nil {
 		return err
 	}
@@ -151,11 +159,16 @@ func errString(e error) string {
 }
 
 // loadTools resolves the manifest at path into a flow.ToolMap. With
-// an empty path, fall back to the bundled echo_chain demo tools so
-// `flow run examples/echo_chain/flow.json` keeps working out-of-box.
+// an empty path, fall back to the union of every bundled example's
+// demo tools so any `examples/*/flow.json` keeps working out-of-box.
+// Real deployments are expected to pass --tools and shape their own
+// tool catalog.
 func loadTools(path string) (flow.ToolMap, error) {
 	if path == "" {
-		return flow.FromAgentTools(echochain.Tools()), nil
+		demo := []agents.Tool{}
+		demo = append(demo, echochain.Tools()...)
+		demo = append(demo, router.Tools()...)
+		return flow.FromAgentTools(demo), nil
 	}
 	f, err := os.Open(path)
 	if err != nil {
@@ -181,6 +194,8 @@ func eventKindString(k flow.FlowEventKind) string {
 		return "node_started"
 	case flow.NodeFinished:
 		return "node_finished"
+	case flow.NodeSkipped:
+		return "node_skipped"
 	case flow.FlowDone:
 		return "flow_done"
 	case flow.FlowErr:

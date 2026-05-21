@@ -8,6 +8,7 @@ package flow
 //	Kind = FlowStarted:  FlowID != ""
 //	Kind = NodeStarted:  NodeID != "" ; Input != nil (post-decode)
 //	Kind = NodeFinished: NodeID != "" ; Output != nil ; Err is non-nil only on failure
+//	Kind = NodeSkipped:  NodeID != ""   (no incoming edge fired)
 //	Kind = FlowDone:     Outputs != nil
 //	Kind = FlowErr:      Err != nil
 type FlowEventKind uint8
@@ -16,6 +17,7 @@ const (
 	FlowStarted  FlowEventKind = iota // engine accepted the flow + inputs
 	NodeStarted                       // a node is about to execute
 	NodeFinished                      // a node finished (Output set, or Err non-nil on failure)
+	NodeSkipped                       // a conditional edge or upstream skip elided this node
 	FlowDone                          // terminal success; Outputs populated
 	FlowErr                           // terminal failure; Err populated
 )

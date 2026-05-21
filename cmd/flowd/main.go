@@ -28,9 +28,12 @@ import (
 	"syscall"
 	"time"
 
+	agents "github.com/costa92/llm-agent"
 	"github.com/costa92/llm-agent-flow/cmd/flowd/server"
 	"github.com/costa92/llm-agent-flow/examples/echo_chain"
+	"github.com/costa92/llm-agent-flow/examples/router"
 	"github.com/costa92/llm-agent-flow/flow"
+	cond "github.com/costa92/llm-agent-flow/flow/cond/cel"
 	toolspkg "github.com/costa92/llm-agent-flow/flow/tools"
 )
 
@@ -67,7 +70,14 @@ func main() {
 		os.Exit(1)
 	}
 
-	engine, err := flow.LoadCompile(f, reg, flow.Deps{Tools: tools}, flow.WithMaxNodeConcurrency(*maxNodeConcurrency))
+	celEval, err := cond.NewEvaluator()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "flowd: cel evaluator:", err)
+		os.Exit(1)
+	}
+	engine, err := flow.LoadCompile(f, reg, flow.Deps{Tools: tools},
+		flow.WithMaxNodeConcurrency(*maxNodeConcurrency),
+		flow.WithConditionEvaluator(celEval))
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "flowd:", err)
 		os.Exit(1)
@@ -101,11 +111,15 @@ func main() {
 }
 
 // loadTools resolves the manifest at path into a flow.ToolMap. With
-// an empty path, fall back to the bundled echo_chain demo tools so
-// `flowd --flow examples/echo_chain/flow.json` boots out-of-box.
+// an empty path, fall back to the union of every bundled example's
+// demo tools so any `examples/*/flow.json` boots out-of-box. Real
+// deployments are expected to pass --tools.
 func loadTools(path string) (flow.ToolMap, error) {
 	if path == "" {
-		return flow.FromAgentTools(echochain.Tools()), nil
+		demo := []agents.Tool{}
+		demo = append(demo, echochain.Tools()...)
+		demo = append(demo, router.Tools()...)
+		return flow.FromAgentTools(demo), nil
 	}
 	f, err := os.Open(path)
 	if err != nil {

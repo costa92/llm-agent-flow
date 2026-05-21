@@ -38,9 +38,23 @@ type Node struct {
 
 // Edge connects one source port on one node to one target port on
 // another. Source.Node == Target.Node is rejected by Validate.
+//
+// Condition (optional) is a guard expression evaluated at run time
+// against an environment containing at least `value` (the source port
+// value as string). When non-empty, the edge fires only if the
+// expression evaluates to true; a false result skips the edge — its
+// target node will NOT receive this value, and if no incoming edge
+// fires the target is "skipped" (no Run, no outputs). An empty
+// Condition (the default) means the edge always fires, preserving
+// the v0.0.x DAG behavior.
+//
+// The expression syntax is determined by the ConditionEvaluator
+// supplied at Compile time; the bundled flow/cond/cel package uses
+// Google CEL.
 type Edge struct {
-	Source PortRef `json:"source"`
-	Target PortRef `json:"target"`
+	Source    PortRef `json:"source"`
+	Target    PortRef `json:"target"`
+	Condition string  `json:"condition,omitempty"`
 }
 
 // PortRef names a (Node, Port) pair. Port is the port-name string

@@ -1,0 +1,23 @@
+{
+  "id": "router",
+  "name": "intent router",
+  "description": "Routes the input to one of two branches based on a CEL condition. The 'classify' tool emits either 'greet' or 'other'; downstream edges fire conditionally.",
+  "nodes": [
+    { "id": "classify",   "type": "tool", "config": { "tool": "classify" } },
+    { "id": "greet_path", "type": "tool", "config": { "tool": "make_greeting" } },
+    { "id": "other_path", "type": "tool", "config": { "tool": "say_other" } }
+  ],
+  "edges": [
+    { "source": { "node": "classify",   "port": "output" },
+      "target": { "node": "greet_path", "port": "input"  },
+      "condition": "value == \"greet\"" },
+    { "source": { "node": "classify",   "port": "output" },
+      "target": { "node": "other_path", "port": "input"  },
+      "condition": "value != \"greet\"" }
+  ],
+  "inputs":  [{ "name": "in",     "node": "classify",   "port": "input" }],
+  "outputs": [
+    { "name": "greeting", "node": "greet_path", "port": "output" },
+    { "name": "other",    "node": "other_path", "port": "output" }
+  ]
+}

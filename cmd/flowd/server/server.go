@@ -152,6 +152,8 @@ func eventKindString(k flow.FlowEventKind) string {
 		return "node_started"
 	case flow.NodeFinished:
 		return "node_finished"
+	case flow.NodeSkipped:
+		return "node_skipped"
 	case flow.FlowDone:
 		return "flow_done"
 	case flow.FlowErr:

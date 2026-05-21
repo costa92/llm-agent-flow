@@ -34,7 +34,7 @@ invoke a flow).
 provisional and may change between v0.0.x tags. SemVer stability
 begins at v0.1.0.
 
-Implemented (v0.0.3):
+Implemented (v0.0.4):
 
 - Flow / Node / Edge / Port Go types with JSON round-trip
 - `Load(r io.Reader) (Flow, error)`
@@ -65,10 +65,19 @@ Implemented (v0.0.3):
   out-of-box.
 - **`tools.KindRegistry.RegisterKind(...)`** lets downstream code add
   custom kinds without forking the library.
+- **CEL conditional edges.** `Edge.Condition` is an optional CEL
+  expression evaluated against `value` (source port output). When
+  set, the edge fires only if the expression returns true; downstream
+  nodes whose incoming edges all skip are themselves skipped
+  (NodeSkipped event). `flow/cond/cel` (separate sub-package) holds
+  the cel-go dependency — the core `flow` library stays stdlib-only.
+- **Activation semantics.** A node runs iff it has no incoming edges,
+  is named by `Flow.Inputs`, or at least one incoming edge fires.
+  Skipped-branch outputs are silently omitted from the result map so
+  router flows can declare both branches' outputs.
 
 Deferred to next phases:
 
-- conditional edges (CEL expressions)
 - run-history store (sqlite) + flow CRUD endpoints
 - `otelflow.Wrap(Engine) Engine` decorator (in `llm-agent-otel`)
 
@@ -139,6 +148,21 @@ flow run examples/echo_chain/flow.json --tools /tmp/tools.json --input in=hello
 ```
 
 See `examples/http_tool/` for a fully-tested end-to-end recipe.
+
+Conditional routing (CEL edges):
+
+```bash
+flow run examples/router/flow.json --input in="hello world"
+# {"greeting":"Hello! Nice to see you."}
+
+flow run examples/router/flow.json --input in="what time is it"
+# {"other":"Sorry — I do not know how to handle that yet."}
+```
+
+The router flow has two outgoing edges from `classify` with CEL
+guards `value == "greet"` and `value != "greet"`. Only the matching
+branch fires; the other is skipped (and emits a `node_skipped`
+event in `--stream` mode).
 
 ## JSON flow shape (v0)
 

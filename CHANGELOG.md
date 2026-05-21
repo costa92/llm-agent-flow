@@ -5,6 +5,58 @@ All notable changes to `github.com/costa92/llm-agent-flow` are documented here.
 <!-- Keep a Changelog: https://keepachangelog.com/en/1.1.0/ -->
 <!-- Semver: https://semver.org/ — note: v0.0.x is provisional. -->
 
+## [v0.0.4] - 2026-05-21
+
+Phase 4 — CEL conditional edges + node activation.
+
+### Added
+
+- **`Edge.Condition` IR field.** Optional CEL expression evaluated at
+  edge-firing time. Empty (the default) preserves the v0.0.3 DAG
+  semantics — every edge always fires.
+- **`flow.ConditionEvaluator` + `flow.Condition` interfaces.** Pluggable
+  guard-expression engine. Compile errors surface at Engine.Compile
+  time so flow load fails fast.
+- **`flow.WithConditionEvaluator(e)` engine option.** Required when
+  any edge has a non-empty Condition. Without it, Compile rejects.
+- **`flow/cond/cel` sub-package.** CEL-backed evaluator
+  (`google/cel-go`). The CORE flow library remains stdlib-only;
+  applications opt in by importing this sub-package explicitly.
+- **Node activation semantics.** A node is active iff it has no
+  incoming edges, OR it is named by Flow.Inputs, OR at least one
+  incoming edge fired. Inactive nodes don't run and don't emit
+  outgoing-edge fires.
+- **`NodeSkipped` FlowEvent kind.** Emitted once per skipped node so
+  tracing layers can distinguish "skipped" from "still pending".
+- **Flow.Outputs from skipped nodes are silently omitted** from the
+  returned outputs map — router-style flows can declare every
+  branch's outputs and only the firing branch contributes.
+- **`cmd/flow` and `cmd/flowd` auto-wire `flow/cond/cel`** so all
+  conditions in user flows just work without extra flags. Both
+  default fallback tool catalogs now include the router demo so
+  `flow run examples/router/flow.json` runs out-of-box.
+- **`examples/router/`.** Two-branch CEL-routed flow + integration
+  test covering both branches.
+
+### Tests
+
+- `flow/engine_cond_test.go` (7 cases): router both-paths, skip
+  propagation, evaluator-required error, compile-time syntax error,
+  runtime evaluate error, backward-compat regression.
+- `flow/cond/cel/cel_test.go` (9 cases): equality, `startsWith`,
+  `matches` regex, `size` + boolean logic, syntax error, non-bool
+  return rejected, unknown variable rejected, engine integration.
+- `examples/router/example_test.go` (2 cases): greet/other branches.
+
+### Dependencies
+
+- Adds `github.com/google/cel-go v0.28.1` (+ ~6 transitive: antlr,
+  protobuf, etc.) at the MODULE level. The `flow` package itself
+  imports none of them; tree-shaking applies to downstream users.
+
+No public API removal vs v0.0.3. The Edge JSON shape is strictly
+additive — pre-v0.0.4 flow files load and run unchanged.
+
 ## [v0.0.3] - 2026-05-21
 
 Phase 3 — tool manifest. Unblocks practical use: any flow can be run
