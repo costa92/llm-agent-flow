@@ -75,6 +75,21 @@ type RunEvent struct {
 	Timestamp time.Time       `json:"ts"`
 }
 
+// RunEventBatchItem is the input shape for store implementations that
+// support bulk-insertion of events (see e.g. sqlite.Store.AppendRunEvents).
+// The Store interface itself does NOT include AppendRunEvents in v0.1
+// — implementations expose it as an optional capability that callers
+// detect via a type assertion. Adding it to the Store interface would
+// break downstream custom implementations and must wait for v0.2.
+//
+// Seq and Timestamp are NOT carried here; they remain server-assigned
+// by the store, matching the single-event AppendRunEvent semantics.
+type RunEventBatchItem struct {
+	Kind    RunEventKind
+	NodeID  string
+	Payload []byte
+}
+
 // ErrNotFound is returned by GetFlow / GetRun when no row matches.
 // Tests should use errors.Is.
 var ErrNotFound = errors.New("flow/store: not found")

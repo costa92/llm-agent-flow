@@ -15,6 +15,7 @@ type BearerTokenAuthenticator struct
 type Config struct
 	field Authenticator Authenticator
 	field Cond flow.ConditionEvaluator
+	field EngineCacheSize int
 	field LegacyFlowID string
 	field Logger *log.Logger
 	field MaxNodeConcurrency int
@@ -145,6 +146,10 @@ type RunEvent struct
 	field Payload json.RawMessage
 	field Seq int
 	field Timestamp time.Time
+type RunEventBatchItem struct
+	field Kind RunEventKind
+	field NodeID string
+	field Payload []byte
 type RunEventKind string
 type RunMeta struct
 	field FinishedAt *time.Time
@@ -175,6 +180,7 @@ var ErrNotFound = errors.New("flow/store: not found")
 package github.com/costa92/llm-agent-flow/flow/store/sqlite
 func Open(dsn string) (*Store, error)
 method (*Store) AppendRunEvent(ctx context.Context, runID string, kind flowstore.RunEventKind, nodeID string, payload []byte) error
+method (*Store) AppendRunEvents(ctx context.Context, runID string, items []flowstore.RunEventBatchItem) error
 method (*Store) Close() error
 method (*Store) DeleteFlow(ctx context.Context, id string) error
 method (*Store) FinishRun(ctx context.Context, runID string, outputs map[string]string, errMsg string) error

@@ -16,6 +16,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -27,6 +28,14 @@ import (
 	"github.com/costa92/llm-agent-flow/flow"
 	flowstore "github.com/costa92/llm-agent-flow/flow/store"
 )
+
+// Ensure stdlib sync stays used (runWithStore still uses sync.Mutex
+// for emit serialization in some call paths). Removing the engine
+// cache's sync.Map dropped one user but emitMu in run handlers
+// still pulls it in transitively via the runtime. This import-
+// pinning comment is a hedge against a future cleanup that removes
+// the last sync usage and leaves the line dangling.
+var _ sync.Mutex
 
 // NewMux is the legacy single-engine wrapper. The returned handler
 // exposes /healthz + /run + /run/stream against the supplied Engine.
@@ -63,13 +72,20 @@ type Config struct {
 	// for the bundled static-token implementation, or supply a custom
 	// implementation for JWT / OAuth / mTLS.
 	Authenticator Authenticator
+
+	// EngineCacheSize caps the number of compiled flow engines kept
+	// in memory. A non-positive value disables bounding — every
+	// flow_id compiled stays cached indefinitely (the v0.1.0
+	// behavior). A positive value enables LRU eviction once the
+	// cache reaches that size; entries are touched on every run.
+	EngineCacheSize int
 }
 
 // Server is the v0.0.5 store-backed HTTP layer. Concurrent-safe;
 // construct once and serve forever.
 type Server struct {
 	cfg     Config
-	engines sync.Map // map[string]*flow.Engine — compiled-flow cache
+	engines *engineCache // LRU-bounded compiled-flow cache
 }
 
 // New returns a Server wired with the supplied Config.
@@ -83,7 +99,7 @@ func New(cfg Config) (*Server, error) {
 	if cfg.Logger == nil {
 		cfg.Logger = log.Default()
 	}
-	return &Server{cfg: cfg}, nil
+	return &Server{cfg: cfg, engines: newEngineCache(cfg.EngineCacheSize)}, nil
 }
 
 // Handler returns the HTTP handler this Server serves.
@@ -117,17 +133,17 @@ func (s *Server) Handler() http.Handler {
 // Close releases the engine cache. Underlying Store ownership stays
 // with the caller.
 func (s *Server) Close() {
-	s.engines.Range(func(k, _ any) bool {
-		s.engines.Delete(k)
-		return true
-	})
+	s.engines = newEngineCache(s.cfg.EngineCacheSize)
 }
 
 // engineFor returns the compiled Engine for id, lazily compiling +
-// caching on miss. On flow update / delete the caller MUST evict via
-// engineEvict(id).
+// caching on miss. The engineCache uses LRU eviction when full —
+// PUT and DELETE handlers still call engineEvict for immediate
+// invalidation. The (*flowstore.FlowRecord, ...) return shape is
+// preserved for v0.1 API compatibility; the record is currently nil
+// on cache hit (callers do not consume it on hit paths).
 func (s *Server) engineFor(id string) (*flow.Engine, *flowstore.FlowRecord, error) {
-	if v, ok := s.engines.Load(id); ok {
+	if v, ok := s.engines.Get(id); ok {
 		return v.(*flow.Engine), nil, nil
 	}
 	rec, err := s.cfg.Store.GetFlow(serverCtxFor(s), id)
@@ -142,8 +158,8 @@ func (s *Server) engineFor(id string) (*flow.Engine, *flowstore.FlowRecord, erro
 	if err != nil {
 		return nil, nil, err
 	}
-	actual, _ := s.engines.LoadOrStore(id, eng)
-	return actual.(*flow.Engine), &rec, nil
+	s.engines.Set(id, eng)
+	return eng, &rec, nil
 }
 
 func (s *Server) engineEvict(id string) { s.engines.Delete(id) }
@@ -404,22 +420,38 @@ func (s *Server) runWithStore(w http.ResponseWriter, r *http.Request, flowID str
 	var (
 		finalOutputs map[string]string
 		finalErr     error
+		// syncBatch collects events for the sync path so they can be
+		// flushed via the optional AppendRunEvents bulk-insert at the
+		// end of the loop. Stream path bypasses the batch and writes
+		// per-event so a dropped client still leaves a complete audit
+		// trail (the v0.0.6 durability guarantee).
+		syncBatch []flowstore.RunEventBatchItem
 	)
+	batcher, canBatch := s.cfg.Store.(interface {
+		AppendRunEvents(ctx context.Context, runID string, items []flowstore.RunEventBatchItem) error
+	})
 	for ev := range ch {
 		payload := streamPayload(ev)
 		payloadRaw := mustJSON(payload)
-
-		// Persist FIRST so events outlive a client that drops the
-		// connection mid-stream. AppendRunEvent failures are logged
-		// but do not abort the run.
-		if perr := s.cfg.Store.AppendRunEvent(serverCtxFor(s), runID,
-			flowstore.RunEventKind(eventKindString(ev.Kind)), ev.NodeID, payloadRaw); perr != nil {
-			s.cfg.Logger.Printf("flowd: AppendRunEvent %s: %v", runID, perr)
-		}
+		kind := flowstore.RunEventKind(eventKindString(ev.Kind))
 
 		if stream {
+			// Stream path: persist FIRST so events outlive a client
+			// that drops the connection mid-stream, then forward.
+			if perr := s.cfg.Store.AppendRunEvent(serverCtxFor(s), runID, kind, ev.NodeID, payloadRaw); perr != nil {
+				s.cfg.Logger.Printf("flowd: AppendRunEvent %s: %v", runID, perr)
+			}
 			writeSSE(w, eventKindString(ev.Kind), payload)
 			flusher.Flush()
+		} else {
+			// Sync path: collect for batched insert. No client is
+			// reading mid-run, so durability only matters at
+			// FinishRun time.
+			syncBatch = append(syncBatch, flowstore.RunEventBatchItem{
+				Kind:    kind,
+				NodeID:  ev.NodeID,
+				Payload: payloadRaw,
+			})
 		}
 
 		switch ev.Kind {
@@ -428,6 +460,25 @@ func (s *Server) runWithStore(w http.ResponseWriter, r *http.Request, flowID str
 		case flow.FlowErr:
 			finalErr = ev.Err
 			s.cfg.Logger.Printf("flowd: /flows/%s/run: %v", flowID, ev.Err)
+		}
+	}
+
+	// Flush the sync batch. If the store supports AppendRunEvents,
+	// one transaction; otherwise fall back to per-event inserts.
+	if !stream && len(syncBatch) > 0 {
+		var perr error
+		if canBatch {
+			perr = batcher.AppendRunEvents(serverCtxFor(s), runID, syncBatch)
+		} else {
+			for _, item := range syncBatch {
+				if e := s.cfg.Store.AppendRunEvent(serverCtxFor(s), runID, item.Kind, item.NodeID, item.Payload); e != nil {
+					perr = e
+					break
+				}
+			}
+		}
+		if perr != nil {
+			s.cfg.Logger.Printf("flowd: AppendRunEvents %s: %v", runID, perr)
 		}
 	}
 

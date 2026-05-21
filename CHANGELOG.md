@@ -5,6 +5,47 @@ All notable changes to `github.com/costa92/llm-agent-flow` are documented here.
 <!-- Keep a Changelog: https://keepachangelog.com/en/1.1.0/ -->
 <!-- Semver: https://semver.org/ — additive-only stability from v0.1.0. -->
 
+## [v0.1.1] - 2026-05-21
+
+Phase 11 — Performance: engine cache LRU + sync-run event batching.
+
+### Added (additive only — v0.1 promise honored)
+
+- **`server.Config.EngineCacheSize`** — bounds the compiled-Engine
+  cache via LRU eviction. Default `0` disables bounding (v0.1.0
+  behavior preserved). PUT/DELETE handlers still evict immediately.
+- **`flow/store.RunEventBatchItem`** — input shape for bulk-insert
+  capable stores. The `Store` interface itself is unchanged in
+  v0.1.x; bulk insertion is exposed as an optional capability via
+  type assertion (`store.(interface { AppendRunEvents(...) error })`).
+- **`(*sqlite.Store).AppendRunEvents(ctx, runID, items)`** —
+  single-transaction multi-INSERT. `seq` continues monotonically from
+  the run's current max; the whole batch shares one `ts`.
+
+### Changed (internal — no API change)
+
+- **Sync `/flows/{id}/run` runs now batch their event persistence.**
+  Events collected during the engine loop are flushed in one
+  transaction at the end of the run. Stream runs (`/run/stream`)
+  unchanged — they still persist per-event before forwarding to
+  preserve the v0.0.6 "events outlive a dropped client" guarantee.
+- **Engine cache is now LRU-bounded** when `EngineCacheSize > 0`.
+  Internal swap from `sync.Map` to a small `container/list`-backed
+  cache; behavior at default (cap=0) is byte-identical to v0.1.0.
+
+### Tests
+
+- `cmd/flowd/server/lru_test.go` (5 cases) — cap=0 unbounded,
+  LRU eviction order, overwrite, delete idempotent, delete-at-cap.
+- `flow/store/sqlite/events_batch_test.go` (4 cases) — happy path,
+  empty batch no-op, unknown run → ErrNotFound, seq continues after
+  single-event Append.
+
+### Snapshot baseline
+
+`api/v0.1.snapshot.txt` regenerated for the additive type
+(`flow/store.RunEventBatchItem`).
+
 ## [v0.1.0] - 2026-05-21
 
 **Phase 10 — SemVer freeze.** The v0.1.x exported API is now
