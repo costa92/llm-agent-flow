@@ -5,6 +5,25 @@ All notable changes to `github.com/costa92/llm-agent-flow` are documented here.
 <!-- Keep a Changelog: https://keepachangelog.com/en/1.1.0/ -->
 <!-- Semver: https://semver.org/ — note: v0.0.x is provisional. -->
 
+## [v0.0.8] - 2026-05-21
+
+Phase 8 — Bearer-token auth + pluggable Authenticator.
+
+### Added
+
+- `server.Authenticator` interface — pluggable extension point.
+  Returning `server.ErrUnauthorized` → 401 + `WWW-Authenticate`
+  Bearer challenge; any other error → 403.
+- `server.BearerTokenAuthenticator{Token: ...}` — static-token
+  implementation with constant-time comparison.
+- `/healthz` bypass — always allowed so external monitors work
+  without a token.
+- `cmd/flowd --token <secret>` (or `FLOWD_TOKEN` env var) — when
+  set, every endpoint except `/healthz` requires
+  `Authorization: Bearer <secret>`.
+
+8 new test cases; no public API removal.
+
 ## [v0.0.7] - 2026-05-21
 
 Phase 7 prep — introduces the seam `llm-agent-otel/otelflow` plugs
