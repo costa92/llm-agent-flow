@@ -5,6 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sync"
+
+	"github.com/costa92/llm-agent/pkg/fanout"
 )
 
 // Engine compiles a parsed Flow against a NodeRegistry + Deps once,
@@ -20,12 +23,29 @@ type Engine struct {
 	nodes  map[string]NodeKind // resolved node runtime
 	layers [][]string          // topological layers (node IDs)
 	preds  map[string][]Edge   // incoming edges per node
+
+	// maxNodeConcurrency caps the number of nodes that may execute
+	// concurrently within a single layer. 0 means "unlimited — one
+	// goroutine per node" (the default). The cap applies per layer
+	// independently; layers themselves remain sequential.
+	maxNodeConcurrency int
+}
+
+// EngineOption configures Compile.
+type EngineOption func(*Engine)
+
+// WithMaxNodeConcurrency caps the number of goroutines spawned inside
+// a single topological layer. n <= 0 means unlimited. Layers remain
+// sequential — a layer's nodes are scheduled only after the previous
+// layer has fully completed.
+func WithMaxNodeConcurrency(n int) EngineOption {
+	return func(e *Engine) { e.maxNodeConcurrency = n }
 }
 
 // Compile validates the flow, resolves every Node type through the
 // registry, then computes the topological layer ordering. Returns a
 // runnable Engine on success.
-func Compile(f Flow, reg *NodeRegistry, deps Deps) (*Engine, error) {
+func Compile(f Flow, reg *NodeRegistry, deps Deps, opts ...EngineOption) (*Engine, error) {
 	if reg == nil {
 		return nil, errors.New("flow: compile: nil registry")
 	}
@@ -80,13 +100,17 @@ func Compile(f Flow, reg *NodeRegistry, deps Deps) (*Engine, error) {
 		// IR drift introduced post-Validate.
 		return nil, errors.New("flow: compile: residual cycle after validate")
 	}
-	return &Engine{
+	eng := &Engine{
 		flow:   f,
 		deps:   deps,
 		nodes:  nodes,
 		layers: layers,
 		preds:  preds,
-	}, nil
+	}
+	for _, opt := range opts {
+		opt(eng)
+	}
+	return eng, nil
 }
 
 // Run executes the flow synchronously with the caller-supplied inputs
@@ -101,8 +125,17 @@ func (e *Engine) Run(ctx context.Context, inputs map[string]string) (map[string]
 // describing each node's lifecycle. The returned channel is closed
 // after the terminal event (FlowDone or FlowErr). Callers MUST drain
 // the channel to avoid blocking the engine; cancel ctx to abort.
+//
+// Within a layer, sibling node events (NodeStarted / NodeFinished)
+// MAY interleave in arrival order. The contract is:
+//
+//   - FlowStarted is always the first event,
+//   - FlowDone / FlowErr is always the last event (channel close immediately follows),
+//   - For any given node, NodeStarted precedes NodeFinished,
+//   - Across nodes in different layers, all events of an earlier layer
+//     precede all events of a later layer.
 func (e *Engine) RunStream(ctx context.Context, inputs map[string]string) (<-chan FlowEvent, error) {
-	ch := make(chan FlowEvent, 8)
+	ch := make(chan FlowEvent, 16)
 	go func() {
 		defer close(ch)
 		_, _ = e.run(ctx, inputs, ch)
@@ -112,10 +145,18 @@ func (e *Engine) RunStream(ctx context.Context, inputs map[string]string) (<-cha
 
 // run is the shared core. ch may be nil for the sync path.
 func (e *Engine) run(ctx context.Context, inputs map[string]string, ch chan<- FlowEvent) (map[string]string, error) {
+	// emit serializes channel sends from multiple node goroutines so
+	// consumers see one event at a time even though sibling nodes run
+	// in parallel. The mutex also covers writes to portValues so a
+	// node's outputs are visible to the next layer without further
+	// synchronization.
+	var emitMu sync.Mutex
 	emit := func(ev FlowEvent) {
 		if ch == nil {
 			return
 		}
+		emitMu.Lock()
+		defer emitMu.Unlock()
 		select {
 		case ch <- ev:
 		case <-ctx.Done():
@@ -125,8 +166,36 @@ func (e *Engine) run(ctx context.Context, inputs map[string]string, ch chan<- Fl
 	emit(FlowEvent{Kind: FlowStarted, FlowID: e.flow.ID})
 
 	// portValues[nodeID][portName] = produced value. Populated by both
-	// declared Flow.Inputs and by upstream node outputs.
+	// declared Flow.Inputs and by upstream node outputs. Reads inside
+	// a layer are safe because the previous layer has fully completed
+	// before the current layer's goroutines start; writes for a node
+	// happen on that node's own goroutine and are read-after-write
+	// only on the NEXT layer.
 	portValues := make(map[string]map[string]string, len(e.flow.Nodes))
+	var pvMu sync.Mutex
+	setPort := func(nodeID, port, value string) {
+		pvMu.Lock()
+		defer pvMu.Unlock()
+		if portValues[nodeID] == nil {
+			portValues[nodeID] = make(map[string]string)
+		}
+		portValues[nodeID][port] = value
+	}
+	getPorts := func(nodeID string) map[string]string {
+		pvMu.Lock()
+		defer pvMu.Unlock()
+		// return a copy so callers can mutate without locking
+		src := portValues[nodeID]
+		if src == nil {
+			return map[string]string{}
+		}
+		out := make(map[string]string, len(src))
+		for k, v := range src {
+			out[k] = v
+		}
+		return out
+	}
+
 	for _, ref := range e.flow.Inputs {
 		v, ok := inputs[ref.Name]
 		if !ok {
@@ -134,31 +203,28 @@ func (e *Engine) run(ctx context.Context, inputs map[string]string, ch chan<- Fl
 			emit(FlowEvent{Kind: FlowErr, Err: err})
 			return nil, err
 		}
-		if portValues[ref.Node] == nil {
-			portValues[ref.Node] = make(map[string]string)
-		}
-		portValues[ref.Node][ref.Port] = v
+		setPort(ref.Node, ref.Port, v)
 	}
 
 	for _, layer := range e.layers {
-		for _, nodeID := range layer {
-			if err := ctx.Err(); err != nil {
-				emit(FlowEvent{Kind: FlowErr, Err: err})
-				return nil, err
-			}
+		if err := ctx.Err(); err != nil {
+			emit(FlowEvent{Kind: FlowErr, Err: err})
+			return nil, err
+		}
 
-			// Wire predecessor edges into the node's input map.
-			in := portValues[nodeID]
-			if in == nil {
-				in = map[string]string{}
-			}
+		// Build one fanout Task per node in this layer. Tasks return
+		// the node's outputs map; errors are captured in the per-task
+		// Result.Err and joined below. WithFailFast cancels peers as
+		// soon as one task errors so long-running siblings exit early.
+		tasks := make([]fanout.Task[map[string]string], 0, len(layer))
+		layerIDs := make([]string, 0, len(layer))
+		for _, nodeID := range layer {
+			nodeID := nodeID
+			node := e.nodes[nodeID]
+
+			in := getPorts(nodeID)
 			for _, edge := range e.preds[nodeID] {
-				upstream := portValues[edge.Source.Node]
-				if upstream == nil {
-					err := fmt.Errorf("flow: run: node %q awaits %q but no value produced", nodeID, edge.Source.Node)
-					emit(FlowEvent{Kind: FlowErr, Err: err})
-					return nil, err
-				}
+				upstream := getPorts(edge.Source.Node)
 				v, ok := upstream[edge.Source.Port]
 				if !ok {
 					err := fmt.Errorf("flow: run: node %q awaits port %q.%q but it was not emitted", nodeID, edge.Source.Node, edge.Source.Port)
@@ -167,34 +233,58 @@ func (e *Engine) run(ctx context.Context, inputs map[string]string, ch chan<- Fl
 				}
 				in[edge.Target.Port] = v
 			}
-			portValues[nodeID] = in
-
-			emit(FlowEvent{Kind: NodeStarted, NodeID: nodeID, Input: cloneStrMap(in)})
-
-			out, err := e.nodes[nodeID].Run(ctx, in)
-			if err != nil {
-				wrapped := fmt.Errorf("flow: run: node %q: %w", nodeID, err)
-				emit(FlowEvent{Kind: NodeFinished, NodeID: nodeID, Err: wrapped})
-				emit(FlowEvent{Kind: FlowErr, Err: wrapped})
-				return nil, wrapped
+			// Persist resolved inputs so getPorts(nodeID) on the next
+			// pass (e.g. an output port lookup by Flow.Outputs) finds
+			// the same values.
+			for k, v := range in {
+				setPort(nodeID, k, v)
 			}
 
-			// Merge node outputs back into the port-value map so
-			// downstream edges can find them on the next layer.
-			if portValues[nodeID] == nil {
-				portValues[nodeID] = make(map[string]string)
+			layerIDs = append(layerIDs, nodeID)
+			tasks = append(tasks, func(taskCtx context.Context) (map[string]string, error) {
+				emit(FlowEvent{Kind: NodeStarted, NodeID: nodeID, Input: cloneStrMap(in)})
+				out, err := node.Run(taskCtx, in)
+				if err != nil {
+					wrapped := fmt.Errorf("flow: run: node %q: %w", nodeID, err)
+					emit(FlowEvent{Kind: NodeFinished, NodeID: nodeID, Err: wrapped})
+					return nil, wrapped
+				}
+				for k, v := range out {
+					setPort(nodeID, k, v)
+				}
+				emit(FlowEvent{Kind: NodeFinished, NodeID: nodeID, Output: cloneStrMap(out)})
+				return out, nil
+			})
+		}
+
+		results, runErr := fanout.Run(ctx, e.maxNodeConcurrency, tasks, fanout.WithFailFast())
+		if runErr != nil {
+			emit(FlowEvent{Kind: FlowErr, Err: runErr})
+			return nil, runErr
+		}
+		// If any task in this layer failed, surface the first error.
+		// Sibling failures (peers also flagged by fail-fast cancel)
+		// produce their own NodeFinished{Err} events already; the
+		// terminal FlowErr is the first non-nil cause in input order.
+		for i, r := range results {
+			if r.Err != nil {
+				// Skip ctx-canceled siblings caused by failfast; surface
+				// only the original cause when possible.
+				if errors.Is(r.Err, context.Canceled) && ctx.Err() == nil {
+					continue
+				}
+				_ = layerIDs[i] // index documented for clarity
+				emit(FlowEvent{Kind: FlowErr, Err: r.Err})
+				return nil, r.Err
 			}
-			for k, v := range out {
-				portValues[nodeID][k] = v
-			}
-			emit(FlowEvent{Kind: NodeFinished, NodeID: nodeID, Output: cloneStrMap(out)})
 		}
 	}
 
 	// Collect declared outputs.
 	outputs := make(map[string]string, len(e.flow.Outputs))
 	for _, ref := range e.flow.Outputs {
-		v, ok := portValues[ref.Node][ref.Port]
+		ports := getPorts(ref.Node)
+		v, ok := ports[ref.Port]
 		if !ok {
 			err := fmt.Errorf("flow: run: output %q awaits %q.%q but it was not emitted", ref.Name, ref.Node, ref.Port)
 			emit(FlowEvent{Kind: FlowErr, Err: err})
@@ -224,10 +314,10 @@ func cloneStrMap(in map[string]string) map[string]string {
 
 // LoadCompile is a convenience for the common load-then-compile path.
 // Equivalent to Load + Compile.
-func LoadCompile(r io.Reader, reg *NodeRegistry, deps Deps) (*Engine, error) {
+func LoadCompile(r io.Reader, reg *NodeRegistry, deps Deps, opts ...EngineOption) (*Engine, error) {
 	f, err := Load(r)
 	if err != nil {
 		return nil, err
 	}
-	return Compile(f, reg, deps)
+	return Compile(f, reg, deps, opts...)
 }
