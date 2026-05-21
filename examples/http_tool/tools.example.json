@@ -1,0 +1,18 @@
+{
+  "tools": [
+    {
+      "name": "upper",
+      "kind": "http",
+      "url":  "http://localhost:8080/upper",
+      "method": "POST",
+      "headers": {"X-App": "llm-agent-flow-example"}
+    },
+    {
+      "name": "reverse",
+      "kind": "http",
+      "url":  "http://localhost:8080/reverse",
+      "method": "POST",
+      "timeout_ms": 5000
+    }
+  ]
+}

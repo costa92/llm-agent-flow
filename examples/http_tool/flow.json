@@ -1,0 +1,15 @@
+{
+  "id": "http_tool_demo",
+  "name": "two-node chain backed by remote HTTP tools",
+  "description": "Same shape as examples/echo_chain, but the upper/reverse tools live behind HTTP endpoints described in a tool manifest.",
+  "nodes": [
+    { "id": "upper",   "type": "tool", "config": { "tool": "upper" } },
+    { "id": "reverse", "type": "tool", "config": { "tool": "reverse" } }
+  ],
+  "edges": [
+    { "source": { "node": "upper",   "port": "output" },
+      "target": { "node": "reverse", "port": "input"  } }
+  ],
+  "inputs":  [{ "name": "in",  "node": "upper",   "port": "input"  }],
+  "outputs": [{ "name": "out", "node": "reverse", "port": "output" }]
+}

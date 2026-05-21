@@ -4,11 +4,16 @@
 // expose /run and /run/stream so callers can invoke it many times
 // without paying the load/validate/compile cost on every request.
 //
-// This is the v0.0.2 narrow shape — one flow per boot, no CRUD, no
+// This is the v0.0.x narrow shape — one flow per boot, no CRUD, no
 // persistence. A flow registry and run-history store are tracked in
 // the project's research SUMMARY as later-phase deliverables.
 //
-//	flowd --addr :7861 --flow examples/echo_chain/flow.json
+//	flowd --addr :7861 \
+//	      --flow  examples/echo_chain/flow.json \
+//	      --tools mytools.json
+//
+// --tools is optional. When unset the bundled echo_chain demo tools
+// are used (suitable for examples/echo_chain/flow.json).
 package main
 
 import (
@@ -26,11 +31,13 @@ import (
 	"github.com/costa92/llm-agent-flow/cmd/flowd/server"
 	"github.com/costa92/llm-agent-flow/examples/echo_chain"
 	"github.com/costa92/llm-agent-flow/flow"
+	toolspkg "github.com/costa92/llm-agent-flow/flow/tools"
 )
 
 func main() {
 	addr := flag.String("addr", ":7861", "HTTP listen address.")
 	flowPath := flag.String("flow", "", "Path to the flow JSON to serve. Required.")
+	toolsPath := flag.String("tools", "", "Path to a tool-manifest JSON (see flow/tools). When unset, the built-in echo_chain demo tools are used.")
 	readTimeout := flag.Duration("read-timeout", 5*time.Second, "HTTP server read timeout.")
 	writeTimeout := flag.Duration("write-timeout", 0, "HTTP server write timeout (0 disables — required for SSE).")
 	maxNodeConcurrency := flag.Int("max-node-concurrency", 0, "Cap on goroutines per topological layer. 0 = unlimited.")
@@ -54,7 +61,11 @@ func main() {
 		fmt.Fprintln(os.Stderr, "flowd: register tool node:", err)
 		os.Exit(1)
 	}
-	tools := flow.FromAgentTools(echochain.Tools())
+	tools, err := loadTools(*toolsPath)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "flowd:", err)
+		os.Exit(1)
+	}
 
 	engine, err := flow.LoadCompile(f, reg, flow.Deps{Tools: tools}, flow.WithMaxNodeConcurrency(*maxNodeConcurrency))
 	if err != nil {
@@ -87,5 +98,28 @@ func main() {
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		log.Printf("flowd: shutdown: %v", err)
 	}
+}
+
+// loadTools resolves the manifest at path into a flow.ToolMap. With
+// an empty path, fall back to the bundled echo_chain demo tools so
+// `flowd --flow examples/echo_chain/flow.json` boots out-of-box.
+func loadTools(path string) (flow.ToolMap, error) {
+	if path == "" {
+		return flow.FromAgentTools(echochain.Tools()), nil
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("open tools manifest: %w", err)
+	}
+	defer f.Close()
+	built, err := toolspkg.LoadAndBuild(f, toolspkg.NewKindRegistry())
+	if err != nil {
+		return nil, err
+	}
+	out := make(flow.ToolMap, len(built))
+	for _, t := range built {
+		out[t.Name()] = t
+	}
+	return out, nil
 }
 

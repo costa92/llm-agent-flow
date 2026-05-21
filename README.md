@@ -34,7 +34,7 @@ invoke a flow).
 provisional and may change between v0.0.x tags. SemVer stability
 begins at v0.1.0.
 
-Implemented (v0.0.2):
+Implemented (v0.0.3):
 
 - Flow / Node / Edge / Port Go types with JSON round-trip
 - `Load(r io.Reader) (Flow, error)`
@@ -51,8 +51,20 @@ Implemented (v0.0.2):
   events within a layer may interleave but per-node ordering and the
   FlowStarted-first / FlowDone-last invariants hold
 - `cmd/flow run <file.json>` CLI
-- **`cmd/flowd`** HTTP service — boots one compiled flow, exposes
-  `GET /healthz`, `POST /run` (sync JSON), `POST /run/stream` (SSE)
+- `cmd/flowd` HTTP service — `GET /healthz`, `POST /run` (sync JSON),
+  `POST /run/stream` (SSE)
+- **`flow/tools` tool-manifest format** — describe tools as JSON;
+  load through `tools.LoadAndBuild`. Two built-in kinds:
+  - `http` — POST `{"input":...}` to a URL; decode `{"output":...}` or
+    fall back to raw body. Headers + timeout configurable.
+  - `exec` — run a command with the JSON args on stdin; capture stdout
+    as the tool output. Timeout and exit-code error handling included.
+- **`--tools <manifest.json>` flag** on both `cmd/flow` and
+  `cmd/flowd`. Without it, the bundled `echo_chain` demo tools are
+  registered so the binary still runs against `examples/echo_chain`
+  out-of-box.
+- **`tools.KindRegistry.RegisterKind(...)`** lets downstream code add
+  custom kinds without forking the library.
 
 Deferred to next phases:
 
@@ -100,6 +112,33 @@ Or from this repo:
 go run ./cmd/flow  run examples/echo_chain/flow.json --input in=hello
 go run ./cmd/flowd --flow examples/echo_chain/flow.json
 ```
+
+With a custom tool manifest (any flow + any tools, no code changes):
+
+```bash
+# upper.json: HTTP-backed tools
+cat > /tmp/tools.json <<'EOF'
+{"tools":[
+  {"name":"upper",  "kind":"http","url":"http://localhost:8080/upper"},
+  {"name":"reverse","kind":"http","url":"http://localhost:8080/reverse"}
+]}
+EOF
+flow run examples/echo_chain/flow.json --tools /tmp/tools.json --input in=hello
+
+# Or use exec-backed tools running on the host:
+cat > /tmp/tools.json <<'EOF'
+{"tools":[
+  {"name":"upper",  "kind":"exec",
+   "command":["python3","-c","import sys,json; print(json.load(sys.stdin)['input'].upper())"]},
+  {"name":"reverse","kind":"exec",
+   "command":["python3","-c","import sys,json; print(json.load(sys.stdin)['input'][::-1])"]}
+]}
+EOF
+flow run examples/echo_chain/flow.json --tools /tmp/tools.json --input in=hello
+# {"out": "OLLEH"}
+```
+
+See `examples/http_tool/` for a fully-tested end-to-end recipe.
 
 ## JSON flow shape (v0)
 

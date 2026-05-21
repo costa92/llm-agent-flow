@@ -2,13 +2,12 @@
 //
 // Subcommands:
 //
-//	flow run <file.json> --input <key>=<value> [--input ...] [--stream]
+//	flow run <file.json> [--tools <manifest.json>] [--input key=value ...] [--stream]
 //
-// Tool resolution at v0.0.x is hard-coded to the bundled echo_chain
-// demo tools. A future release will accept a manifest naming the Go
-// package whose tools should be registered, or a plugin-driver
-// interface — for now the CLI is intentionally narrow so it can be
-// the integration-test driver.
+// With --tools, the CLI loads a tool manifest (see flow/tools) that
+// describes the tools the flow's nodes reference by name. Without
+// --tools, the bundled echo_chain demo tools (upper / reverse) are
+// registered for backward compat.
 package main
 
 import (
@@ -23,6 +22,7 @@ import (
 
 	"github.com/costa92/llm-agent-flow/examples/echo_chain"
 	"github.com/costa92/llm-agent-flow/flow"
+	toolspkg "github.com/costa92/llm-agent-flow/flow/tools"
 )
 
 func main() {
@@ -47,7 +47,7 @@ func run(args []string) error {
 }
 
 func printUsage(w io.Writer) {
-	fmt.Fprintln(w, "usage: flow run <file.json> [--input key=value ...] [--stream]")
+	fmt.Fprintln(w, "usage: flow run <file.json> [--tools manifest.json] [--input key=value ...] [--stream]")
 }
 
 type inputList []string
@@ -72,6 +72,7 @@ func cmdRun(args []string) error {
 	var ins inputList
 	fs.Var(&ins, "input", `Flow input as "key=value". Repeatable.`)
 	stream := fs.Bool("stream", false, "Print FlowEvents as they happen instead of just the final outputs.")
+	toolsPath := fs.String("tools", "", "Path to a tool-manifest JSON (see flow/tools). When unset, the built-in echo_chain demo tools are used.")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
@@ -95,11 +96,15 @@ func cmdRun(args []string) error {
 	}
 	defer f.Close()
 
+	tools, err := loadTools(*toolsPath)
+	if err != nil {
+		return err
+	}
+
 	reg := flow.NewNodeRegistry()
 	if err := flow.RegisterToolNode(reg); err != nil {
 		return fmt.Errorf("flow run: register tool node: %w", err)
 	}
-	tools := flow.FromAgentTools(echochain.Tools())
 	engine, err := flow.LoadCompile(f, reg, flow.Deps{Tools: tools})
 	if err != nil {
 		return err
@@ -143,6 +148,29 @@ func errString(e error) string {
 		return ""
 	}
 	return e.Error()
+}
+
+// loadTools resolves the manifest at path into a flow.ToolMap. With
+// an empty path, fall back to the bundled echo_chain demo tools so
+// `flow run examples/echo_chain/flow.json` keeps working out-of-box.
+func loadTools(path string) (flow.ToolMap, error) {
+	if path == "" {
+		return flow.FromAgentTools(echochain.Tools()), nil
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("flow run: open tools manifest: %w", err)
+	}
+	defer f.Close()
+	built, err := toolspkg.LoadAndBuild(f, toolspkg.NewKindRegistry())
+	if err != nil {
+		return nil, err
+	}
+	out := make(flow.ToolMap, len(built))
+	for _, t := range built {
+		out[t.Name()] = t
+	}
+	return out, nil
 }
 
 func eventKindString(k flow.FlowEventKind) string {
