@@ -1,0 +1,8 @@
+/go.work
+/go.work.sum
+/.idea/
+/.vscode/
+/bin/
+/dist/
+*.test
+*.out

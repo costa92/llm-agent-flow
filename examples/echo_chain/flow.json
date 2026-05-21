@@ -1,0 +1,15 @@
+{
+  "id": "echo_chain",
+  "name": "echo chain",
+  "description": "Pipes a single string through two trivial Tools (upper then reverse).",
+  "nodes": [
+    { "id": "upper",   "type": "tool", "config": { "tool": "upper" } },
+    { "id": "reverse", "type": "tool", "config": { "tool": "reverse" } }
+  ],
+  "edges": [
+    { "source": { "node": "upper",   "port": "output" },
+      "target": { "node": "reverse", "port": "input"  } }
+  ],
+  "inputs":  [{ "name": "in",  "node": "upper",   "port": "input"  }],
+  "outputs": [{ "name": "out", "node": "reverse", "port": "output" }]
+}
