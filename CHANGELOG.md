@@ -5,6 +5,23 @@ All notable changes to `github.com/costa92/llm-agent-flow` are documented here.
 <!-- Keep a Changelog: https://keepachangelog.com/en/1.1.0/ -->
 <!-- Semver: https://semver.org/ — note: v0.0.x is provisional. -->
 
+## [v0.0.9] - 2026-05-21
+
+Phase 9 — Replay endpoint.
+
+### Added
+
+- `POST /runs/{id}/replay` — re-streams a run's persisted events as
+  a fresh SSE session. No new engine run; the events come straight
+  out of `run_events`. `X-Replay: true` + `X-Run-ID` identify the
+  replay. Stored payload JSON is forwarded verbatim so clients
+  decode replay frames identically to live frames.
+
+Unknown run id → 404. Wrong method → 405. Empty event log → 200
+with zero SSE frames (idempotent).
+
+4 new test cases.
+
 ## [v0.0.8] - 2026-05-21
 
 Phase 8 — Bearer-token auth + pluggable Authenticator.
