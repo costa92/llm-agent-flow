@@ -1,35 +1,58 @@
 name: delete-merged-branch
 
 on:
-  pull_request_target:
-    types: [closed]
+  push:
+    branches:
+      - main
+      - master
 
 permissions:
   contents: write
+  pull-requests: read
 
 concurrency:
-  group: delete-merged-branch-${{ github.event.pull_request.number }}
+  group: delete-merged-branch-${{ github.sha }}
   cancel-in-progress: true
 
 jobs:
   delete-merged-branch:
-    if: github.event.pull_request.merged == true
     runs-on: ubuntu-latest
     steps:
       - name: Delete merged head branch
         uses: actions/github-script@v7
         with:
           script: |
-            const pr = context.payload.pull_request;
-            const repository = context.payload.repository;
-            const sameRepo = pr.head.repo && pr.head.repo.full_name === repository.full_name;
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const mergeSha = context.sha;
+            const defaultBranch = context.payload.repository.default_branch;
+            const pushedRef = context.ref.replace("refs/heads/", "");
+
+            if (pushedRef !== defaultBranch) {
+              core.info(`Skip push to non-default branch ${pushedRef}`);
+              return;
+            }
+
+            const { data: pulls } = await github.rest.repos.listPullRequestsAssociatedWithCommit({
+              owner,
+              repo,
+              commit_sha: mergeSha,
+            });
+
+            if (!pulls.length) {
+              core.info(`No PR associated with commit ${mergeSha}`);
+              return;
+            }
+
+            const pr = pulls.find((item) => item.merged_at) ?? pulls[0];
+            const sameRepo = pr.head.repo && pr.head.repo.full_name === context.payload.repository.full_name;
 
             if (!sameRepo) {
               core.info(`Skip deleting fork branch ${pr.head.label}`);
               return;
             }
 
-            if (pr.head.ref === repository.default_branch) {
+            if (pr.head.ref === defaultBranch) {
               core.info(`Skip deleting default branch ${pr.head.ref}`);
               return;
             }
@@ -38,8 +61,8 @@ jobs:
 
             try {
               await github.rest.git.getRef({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
+                owner,
+                repo,
                 ref,
               });
             } catch (error) {
@@ -51,9 +74,9 @@ jobs:
             }
 
             await github.rest.git.deleteRef({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
+              owner,
+              repo,
               ref,
             });
 
-            core.info(`Deleted merged branch ${pr.head.ref}`);
+            core.info(`Deleted merged branch ${pr.head.ref} for PR #${pr.number}`);
