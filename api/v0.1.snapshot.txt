@@ -1,0 +1,201 @@
+# llm-agent-flow v0.1 exported API snapshot — generated, do not hand-edit.
+package github.com/costa92/llm-agent-flow
+package github.com/costa92/llm-agent-flow/cmd/flow
+package github.com/costa92/llm-agent-flow/cmd/flowd
+package github.com/costa92/llm-agent-flow/cmd/flowd/server
+method (BearerTokenAuthenticator) Authenticate(r *http.Request) error
+func New(cfg Config) (*Server, error)
+func NewMux(engine *flow.Engine, logger *log.Logger) http.Handler
+method (*Server) Close()
+method (*Server) Handler() http.Handler
+type Authenticator interface
+	method Authenticate(r *http.Request) error
+type BearerTokenAuthenticator struct
+	field Token string
+type Config struct
+	field Authenticator Authenticator
+	field Cond flow.ConditionEvaluator
+	field LegacyFlowID string
+	field Logger *log.Logger
+	field MaxNodeConcurrency int
+	field Registry *flow.NodeRegistry
+	field Store flowstore.Store
+	field Tools flow.ToolMap
+type Server struct
+var ErrUnauthorized = errors.New("unauthorized")
+package github.com/costa92/llm-agent-flow/examples/echo_chain
+func Tools() []agents.Tool
+package github.com/costa92/llm-agent-flow/examples/router
+func Tools() []agents.Tool
+package github.com/costa92/llm-agent-flow/flow
+const FlowDone
+const FlowErr
+const FlowStarted FlowEventKind = iota
+const NodeFinished
+const NodeSkipped
+const NodeStarted
+const TypeTool = "tool"
+func Compile(f Flow, reg *NodeRegistry, deps Deps, opts ...EngineOption) (*Engine, error)
+method (*Engine) FlowID() string
+method (*Engine) FlowName() string
+method (*Engine) Run(ctx context.Context, inputs map[string]string) (map[string]string, error)
+method (*Engine) RunStream(ctx context.Context, inputs map[string]string) (<-chan FlowEvent, error)
+func FromAgentTool(t agents.Tool) Tool
+func FromAgentTools(ts []agents.Tool) ToolMap
+func Load(r io.Reader) (Flow, error)
+func LoadCompile(r io.Reader, reg *NodeRegistry, deps Deps, opts ...EngineOption) (*Engine, error)
+func Marshal(f Flow) ([]byte, error)
+func NewNodeRegistry() *NodeRegistry
+method (*NodeRegistry) Build(n Node, deps Deps) (NodeKind, error)
+method (*NodeRegistry) Register(typ string, fac NodeFactory) error
+func RegisterToolNode(r *NodeRegistry) error
+method (ToolMap) Lookup(name string) (Tool, bool)
+func Validate(f Flow) error
+method (*ValidateError) Error() string
+func WithConditionEvaluator(e ConditionEvaluator) EngineOption
+func WithMaxNodeConcurrency(n int) EngineOption
+type CondEnv struct
+	field Value string
+type Condition interface
+	method Evaluate(ctx context.Context, env CondEnv) (bool, error)
+type ConditionEvaluator interface
+	method Compile(expr string) (Condition, error)
+type Deps struct
+	field Tools ToolLookup
+type Edge struct
+	field Condition string
+	field Source PortRef
+	field Target PortRef
+type Engine struct
+type EngineOption func(*engineConfig)
+type Flow struct
+	field Description string
+	field Edges []Edge
+	field ID string
+	field Inputs []NamedPortRef
+	field Name string
+	field Nodes []Node
+	field Outputs []NamedPortRef
+type FlowEvent struct
+	field Err error
+	field FlowID string
+	field Input map[string]string
+	field Kind FlowEventKind
+	field NodeID string
+	field Output map[string]string
+	field Outputs map[string]string
+type FlowEventKind uint8
+type NamedPortRef struct
+	field Name string
+	field PortRef
+type Node struct
+	field Config json.RawMessage
+	field ID string
+	field Type string
+type NodeFactory func(cfg json.RawMessage, deps Deps) (NodeKind, error)
+type NodeKind interface
+	method Inputs() []Port
+	method Outputs() []Port
+	method Run(ctx context.Context, in map[string]string) (map[string]string, error)
+type NodeRegistry struct
+type Port struct
+	field Name string
+	field Type string
+type PortRef struct
+	field Node string
+	field Port string
+type Runner interface
+	method Run(ctx context.Context, inputs map[string]string) (map[string]string, error)
+	method RunStream(ctx context.Context, inputs map[string]string) (<-chan FlowEvent, error)
+type Tool interface
+	method Execute(ctx context.Context, args json.RawMessage) (string, error)
+	method Name() string
+type ToolLookup interface
+	method Lookup(name string) (Tool, bool)
+type ToolMap map[string]Tool
+type ValidateError struct
+	field Issues []string
+var ErrEmptyFlow = errors.New("flow: validate: no nodes")
+package github.com/costa92/llm-agent-flow/flow/cond/cel
+method (*Evaluator) Compile(expr string) (flow.Condition, error)
+func MustNewEvaluator() *Evaluator
+func NewEvaluator() (*Evaluator, error)
+type Evaluator struct
+package github.com/costa92/llm-agent-flow/flow/store
+const RunEventFlowDone RunEventKind = "flow_done"
+const RunEventFlowErr RunEventKind = "flow_err"
+const RunEventFlowStarted RunEventKind = "flow_started"
+const RunEventNodeFinished RunEventKind = "node_finished"
+const RunEventNodeSkipped RunEventKind = "node_skipped"
+const RunEventNodeStarted RunEventKind = "node_started"
+const RunStatusDone RunStatus = "done"
+const RunStatusFailed RunStatus = "failed"
+const RunStatusRunning RunStatus = "running"
+type FlowMeta struct
+	field CreatedAt time.Time
+	field ID string
+	field Name string
+	field UpdatedAt time.Time
+type FlowRecord struct
+	field FlowMeta
+	field JSON []byte
+type RunEvent struct
+	field Kind RunEventKind
+	field NodeID string
+	field Payload json.RawMessage
+	field Seq int
+	field Timestamp time.Time
+type RunEventKind string
+type RunMeta struct
+	field FinishedAt *time.Time
+	field FlowID string
+	field ID string
+	field StartedAt time.Time
+	field Status RunStatus
+type RunRecord struct
+	field Error string
+	field Inputs map[string]string
+	field Outputs map[string]string
+	field RunMeta
+type RunStatus string
+type Store interface
+	method AppendRunEvent(ctx context.Context, runID string, kind RunEventKind, nodeID string, payload []byte) error
+	method Close() error
+	method DeleteFlow(ctx context.Context, id string) error
+	method FinishRun(ctx context.Context, runID string, outputs map[string]string, errMsg string) error
+	method GetFlow(ctx context.Context, id string) (FlowRecord, error)
+	method GetRun(ctx context.Context, runID string) (RunRecord, error)
+	method ListFlows(ctx context.Context, limit int) ([]FlowMeta, error)
+	method ListRunEvents(ctx context.Context, runID string, limit int) ([]RunEvent, error)
+	method ListRuns(ctx context.Context, flowID string, limit int) ([]RunMeta, error)
+	method PutFlow(ctx context.Context, id, name string, json []byte, create bool) (FlowRecord, error)
+	method StartRun(ctx context.Context, flowID string, inputs map[string]string) (string, error)
+var ErrAlreadyExists = errors.New("flow/store: already exists")
+var ErrNotFound = errors.New("flow/store: not found")
+package github.com/costa92/llm-agent-flow/flow/store/sqlite
+func Open(dsn string) (*Store, error)
+method (*Store) AppendRunEvent(ctx context.Context, runID string, kind flowstore.RunEventKind, nodeID string, payload []byte) error
+method (*Store) Close() error
+method (*Store) DeleteFlow(ctx context.Context, id string) error
+method (*Store) FinishRun(ctx context.Context, runID string, outputs map[string]string, errMsg string) error
+method (*Store) GetFlow(ctx context.Context, id string) (flowstore.FlowRecord, error)
+method (*Store) GetRun(ctx context.Context, runID string) (flowstore.RunRecord, error)
+method (*Store) ListFlows(ctx context.Context, limit int) ([]flowstore.FlowMeta, error)
+method (*Store) ListRunEvents(ctx context.Context, runID string, limit int) ([]flowstore.RunEvent, error)
+method (*Store) ListRuns(ctx context.Context, flowID string, limit int) ([]flowstore.RunMeta, error)
+method (*Store) PutFlow(ctx context.Context, id, name string, jsonBytes []byte, create bool) (flowstore.FlowRecord, error)
+method (*Store) StartRun(ctx context.Context, flowID string, inputs map[string]string) (string, error)
+type Store struct
+package github.com/costa92/llm-agent-flow/flow/tools
+method (*KindRegistry) Build(m Manifest) ([]flow.Tool, error)
+method (*KindRegistry) RegisterKind(name string, factory func(Spec) (flow.Tool, error)) error
+func LoadAndBuild(r io.Reader, reg *KindRegistry) ([]flow.Tool, error)
+func LoadManifest(r io.Reader) (Manifest, error)
+func NewKindRegistry() *KindRegistry
+type KindRegistry struct
+type Manifest struct
+	field Tools []Spec
+type Spec struct
+	field Kind string
+	field Name string
+	field Raw json.RawMessage

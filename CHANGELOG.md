@@ -3,7 +3,32 @@
 All notable changes to `github.com/costa92/llm-agent-flow` are documented here.
 
 <!-- Keep a Changelog: https://keepachangelog.com/en/1.1.0/ -->
-<!-- Semver: https://semver.org/ — note: v0.0.x is provisional. -->
+<!-- Semver: https://semver.org/ — additive-only stability from v0.1.0. -->
+
+## [v0.1.0] - 2026-05-21
+
+**Phase 10 — SemVer freeze.** The v0.1.x exported API is now
+guaranteed additive-only. v0.0.x was an exploration band; v0.1.0
+freezes the surface and lays down the diff machinery that keeps it
+frozen.
+
+### Added
+
+- `docs/compatibility.md` — written stability promise. Within
+  v0.1.x: no exported symbol removed, renamed, or re-signed; flow
+  JSON IR additive-only; breaking changes go to `/v2`.
+- `internal/apisnapshot/` — exported-API snapshot gate. Pure stdlib
+  (`go/parser` + `go/printer`); runs on every `go test`; fails any
+  drift against `api/v0.1.snapshot.txt`. Deliberate additive
+  changes regenerate the baseline with `-update`.
+- `api/v0.1.snapshot.txt` — the committed baseline.
+
+### Changed
+
+- Status: v0.0.x walking-skeleton band → v0.1.x stable.
+
+No new product features in this tag; the freeze IS the deliverable.
+All v0.0.9 endpoints / library functions are preserved verbatim.
 
 ## [v0.0.9] - 2026-05-21
 
