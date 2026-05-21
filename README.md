@@ -3,6 +3,17 @@
 Serializable flow IR + DAG executor for the
 [`llm-agent`](https://github.com/costa92/llm-agent) ecosystem.
 
+## Docs
+
+- **[Tutorial](docs/tutorial.md)** — your first flow, custom tools,
+  conditional routing, `cmd/flowd` REST API.
+- **[Architecture](docs/architecture.md)** — how Engine / Store /
+  otelflow / flowd compose; Runner interface; execution model.
+- **[Operations](docs/operations.md)** — deploying `flowd`: auth,
+  SQLite, OTel, perf, backup, upgrade path.
+- **[Compatibility promise](docs/compatibility.md)** — what the v0.1
+  freeze covers; how the snapshot gate works.
+
 A flow is a directed acyclic graph of nodes connected by typed edges,
 authored as JSON, validated at load time, and executed by a topological
 engine. Each node wraps an existing `llm-agent` primitive
