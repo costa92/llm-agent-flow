@@ -5,6 +5,23 @@ All notable changes to `github.com/costa92/llm-agent-flow` are documented here.
 <!-- Keep a Changelog: https://keepachangelog.com/en/1.1.0/ -->
 <!-- Semver: https://semver.org/ — note: v0.0.x is provisional. -->
 
+## [v0.0.7] - 2026-05-21
+
+Phase 7 prep — introduces the seam `llm-agent-otel/otelflow` plugs
+into.
+
+### Added
+
+- **`flow.Runner` interface.** Exactly `Run(ctx, inputs)` +
+  `RunStream(ctx, inputs)`. `*flow.Engine` satisfies it; the package
+  carries a compile-time assertion so wrapper packages can rely on
+  it without explicit type assertions.
+- **`(*Engine).FlowID() string`** and **`FlowName() string`** —
+  read-only getters useful as span attributes / log fields in
+  wrappers. The underlying fields remain unexported.
+
+Pure additive; no existing API touched. No new dependency.
+
 ## [v0.0.6] - 2026-05-21
 
 Phase 6 — Per-event run-history persistence.
