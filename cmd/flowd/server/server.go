@@ -43,8 +43,7 @@ func NewMux(engine *flow.Engine, logger *log.Logger) http.Handler {
 	return mux
 }
 
-// Config is the input bundle for New. All fields except LegacyFlowID
-// are required.
+// Config is the input bundle for New. Required: Store, Registry.
 type Config struct {
 	Store              flowstore.Store         // persistence
 	Registry           *flow.NodeRegistry      // shared across compiled engines
@@ -57,6 +56,13 @@ type Config struct {
 	// to this flow id. Bootstraps the v0.0.4 single-flow workflow on
 	// top of the v0.0.5 store-backed server.
 	LegacyFlowID string
+
+	// Authenticator, when non-nil, gates every endpoint except
+	// /healthz. The default (nil) leaves the API open — backward
+	// compatible with v0.0.7 callers. Use BearerTokenAuthenticator
+	// for the bundled static-token implementation, or supply a custom
+	// implementation for JWT / OAuth / mTLS.
+	Authenticator Authenticator
 }
 
 // Server is the v0.0.5 store-backed HTTP layer. Concurrent-safe;
@@ -104,7 +110,7 @@ func (s *Server) Handler() http.Handler {
 		mux.HandleFunc("POST /run/stream", s.handleLegacyRunStream)
 	}
 
-	return mux
+	return withAuth(s.cfg.Authenticator, mux)
 }
 
 // Close releases the engine cache. Underlying Store ownership stays

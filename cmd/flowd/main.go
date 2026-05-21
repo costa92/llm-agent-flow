@@ -47,7 +47,13 @@ func main() {
 	readTimeout := flag.Duration("read-timeout", 5*time.Second, "HTTP server read timeout.")
 	writeTimeout := flag.Duration("write-timeout", 0, "HTTP server write timeout (0 disables — required for SSE).")
 	maxNodeConcurrency := flag.Int("max-node-concurrency", 0, "Cap on goroutines per topological layer. 0 = unlimited.")
+	token := flag.String("token", "", "Static bearer token; when set, every endpoint except /healthz requires \"Authorization: Bearer <token>\". The FLOWD_TOKEN env var sets the same field; the flag wins when both are provided.")
 	flag.Parse()
+
+	tok := *token
+	if tok == "" {
+		tok = os.Getenv("FLOWD_TOKEN")
+	}
 
 	store, err := sqlitestore.Open(*dbPath)
 	if err != nil {
@@ -83,6 +89,12 @@ func main() {
 		log.Printf("flowd: seeded flow %q from %s", id, *flowPath)
 	}
 
+	var auth server.Authenticator
+	if tok != "" {
+		auth = server.BearerTokenAuthenticator{Token: tok}
+		log.Printf("flowd: bearer-token authentication enabled")
+	}
+
 	srvCfg := server.Config{
 		Store:              store,
 		Registry:           reg,
@@ -91,6 +103,7 @@ func main() {
 		MaxNodeConcurrency: *maxNodeConcurrency,
 		Logger:             log.Default(),
 		LegacyFlowID:       legacyID,
+		Authenticator:      auth,
 	}
 	flowdServer, err := server.New(srvCfg)
 	if err != nil {
