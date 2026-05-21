@@ -34,7 +34,7 @@ invoke a flow).
 provisional and may change between v0.0.x tags. SemVer stability
 begins at v0.1.0.
 
-Implemented (v0.0.4):
+Implemented (v0.0.5):
 
 - Flow / Node / Edge / Port Go types with JSON round-trip
 - `Load(r io.Reader) (Flow, error)`
@@ -75,11 +75,30 @@ Implemented (v0.0.4):
   is named by `Flow.Inputs`, or at least one incoming edge fires.
   Skipped-branch outputs are silently omitted from the result map so
   router flows can declare both branches' outputs.
+- **SQLite-backed persistence + run history.** `flow/store` exposes a
+  pluggable `Store` interface; `flow/store/sqlite` is a pure-Go
+  implementation backed by `modernc.org/sqlite` (no CGO). Flows are
+  CRUD-managed; runs are recorded with status / inputs / outputs /
+  error / timestamps.
+- **flowd REST API.** Full surface:
+  - `POST /flows`, `GET /flows`, `GET /flows/{id}`, `PUT /flows/{id}`,
+    `DELETE /flows/{id}` — flow CRUD; PUT/DELETE invalidates the
+    compiled-engine cache.
+  - `POST /flows/{id}/run` — sync; returns `X-Run-ID` header + run id
+    in body.
+  - `POST /flows/{id}/run/stream` — SSE; same X-Run-ID, final outcome
+    persisted on stream close.
+  - `GET /flows/{id}/runs` — list runs for a flow.
+  - `GET /runs/{id}` — full run record (inputs / outputs / error).
+  - `POST /run`, `POST /run/stream` — legacy aliases against the seed
+    flow set by `--flow`. v0.0.4 clients keep working.
 
 Deferred to next phases:
 
-- run-history store (sqlite) + flow CRUD endpoints
+- per-event run-history persistence (currently only start/finish are
+  stored; intermediate FlowEvents are stream-only)
 - `otelflow.Wrap(Engine) Engine` decorator (in `llm-agent-otel`)
+- AuthN / authZ on the HTTP API (no auth at v0.0.x)
 
 ## Quick start
 
@@ -94,25 +113,58 @@ flow run examples/echo_chain/flow.json --input in=hello --stream
 # one JSON line per FlowEvent
 ```
 
-HTTP service (long-running):
+HTTP service (long-running, with persistence):
 
 ```bash
 go install github.com/costa92/llm-agent-flow/cmd/flowd@latest
+
+# In-memory (ephemeral) mode — fastest start, useful for demos:
 flowd --addr :7861 --flow examples/echo_chain/flow.json
 
-# in another shell:
-curl http://localhost:7861/healthz
-# ok
+# Or with on-disk SQLite for run history that survives restarts:
+flowd --addr :7861 --db /var/lib/flowd/flow.db
+```
 
-curl -X POST http://localhost:7861/run \
+CRUD against `/flows`:
+
+```bash
+# Create a flow.
+curl -X POST http://localhost:7861/flows \
+     -H 'Content-Type: application/json' \
+     --data-binary "{\"flow\":$(cat examples/echo_chain/flow.json)}"
+# 201 with the FlowRecord
+
+# List flows.
+curl http://localhost:7861/flows
+# {"flows":[{"id":"echo_chain", ...}]}
+
+# Run + capture the run id from the X-Run-ID header.
+curl -i -X POST http://localhost:7861/flows/echo_chain/run \
      -H 'Content-Type: application/json' \
      -d '{"inputs":{"in":"hello"}}'
-# {"outputs":{"out":"OLLEH"}}
+# HTTP/1.1 200 OK
+# X-Run-ID: 4351cce92d54ba5d
+# {"outputs":{"out":"OLLEH"},"run_id":"4351cce92d54ba5d"}
 
-curl -X POST http://localhost:7861/run/stream \
+# List the run history for a flow.
+curl http://localhost:7861/flows/echo_chain/runs
+# {"runs":[{"id":"...","status":"done", ...}]}
+
+# Fetch a single run with full inputs/outputs/error.
+curl http://localhost:7861/runs/4351cce92d54ba5d
+# {"id":"4351cce92d54ba5d","status":"done","inputs":{"in":"hello"},
+#  "outputs":{"out":"OLLEH"},...}
+
+# SSE-stream a run.
+curl -X POST http://localhost:7861/flows/echo_chain/run/stream \
      -H 'Content-Type: application/json' \
      -d '{"inputs":{"in":"hello"}}'
-# SSE stream of FlowEvents
+# event: flow_started \n data: {...} \n\n ... (final flow_done persisted)
+
+# Legacy clients still work when --flow is supplied:
+curl http://localhost:7861/healthz                  # ok
+curl -X POST http://localhost:7861/run -H 'Content-Type: application/json' \
+     -d '{"inputs":{"in":"hi"}}'                    # 200 OK
 ```
 
 Or from this repo:

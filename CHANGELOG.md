@@ -5,6 +5,75 @@ All notable changes to `github.com/costa92/llm-agent-flow` are documented here.
 <!-- Keep a Changelog: https://keepachangelog.com/en/1.1.0/ -->
 <!-- Semver: https://semver.org/ — note: v0.0.x is provisional. -->
 
+## [v0.0.5] - 2026-05-21
+
+Phase 5 — Run history (SQLite) + flow CRUD endpoints. The most
+architectural phase of the v0.0.x band: flowd grows from a
+single-flow server into a fully store-backed REST service.
+
+### Added
+
+- **`flow/store` package.** Pluggable `Store` interface for flow
+  CRUD + run lifecycle. Types: `FlowMeta`, `FlowRecord`, `RunMeta`,
+  `RunRecord`, `RunStatus`. Sentinel errors `ErrNotFound`,
+  `ErrAlreadyExists`.
+- **`flow/store/sqlite` sub-package.** Pure-Go SQLite-backed Store
+  using `modernc.org/sqlite` (no CGO required). Schema migrates
+  on-open; supports `":memory:"` for tests. The core `flow` library
+  remains stdlib-only at the source level — the dep enters only when
+  this sub-package is imported.
+- **flowd HTTP REST surface.**
+  - `POST /flows`, `GET /flows`, `GET /flows/{id}`, `PUT /flows/{id}`,
+    `DELETE /flows/{id}` — flow CRUD with compile-probe validation
+    on create/update (bad flow JSON fails fast with 400 instead of
+    surfacing at run time).
+  - `POST /flows/{id}/run` (sync) — returns `X-Run-ID` header and
+    run_id in body. Result persisted as `done` or `failed`.
+  - `POST /flows/{id}/run/stream` (SSE) — same `X-Run-ID`; final
+    outcome captured on stream close.
+  - `GET /flows/{id}/runs` — run history for a flow (ordered
+    descending by `started_at`).
+  - `GET /runs/{id}` — single run record with full inputs / outputs
+    / error.
+- **Engine cache.** `server.Server` holds a `sync.Map` of compiled
+  Engines keyed by flow id; PUT and DELETE evict the cache.
+- **`cmd/flowd --db <path>` flag.** Defaults to `:memory:` so the
+  binary still boots out-of-box. On-disk DSNs persist run history
+  across restarts.
+- **`cmd/flowd --flow` becomes optional.** When supplied, the file
+  is seeded into the store at boot AND enables the legacy `/run` /
+  `/run/stream` aliases for v0.0.4 backward compat (routed to that
+  flow's id).
+- **`server.New(cfg) (*Server, error)`** — new constructor for the
+  v0.0.5 surface. `server.NewMux(engine, logger)` is retained for
+  the single-engine no-persistence pattern.
+
+### Tests
+
+- `flow/store/sqlite/store_test.go` (11 cases): flow CRUD round-trip,
+  duplicate-create rejection, PUT replace semantics, ListFlows
+  ordering, run lifecycle, failed-run path, ListRuns ordering,
+  ErrNotFound surfacing, flow delete preserving historical runs.
+- `cmd/flowd/server/server_crud_test.go` (15 cases): create happy /
+  conflict / bad-compile, list, get, get-missing, PUT with cache
+  invalidation, delete, run records run with X-Run-ID, list runs,
+  get run record, failed-run is persisted as `failed`, legacy
+  `/run` routing, no-legacy-route returns 404.
+
+### Live smoke confirmed end-to-end:
+- POST a flow → list → run twice → list runs → get one run record
+  → DELETE → subsequent run returns 404.
+
+### Dependencies
+
+- Adds `modernc.org/sqlite v1.50.1` (pure-Go) at the module level.
+  The `flow` package and its existing sub-packages import none of it.
+
+No public API removal vs v0.0.4. The `Edge.Condition` and `Engine`
+contracts are unchanged. The HTTP service grew new endpoints; the
+old `/run`, `/run/stream`, `/healthz` continue to work when `--flow`
+seeds a flow at boot.
+
 ## [v0.0.4] - 2026-05-21
 
 Phase 4 — CEL conditional edges + node activation.

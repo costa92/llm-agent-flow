@@ -1,19 +1,19 @@
 // Command flowd is the long-running HTTP variant of cmd/flow.
 //
-// Boot mode: load + validate + compile a single flow.json at startup;
-// expose /run and /run/stream so callers can invoke it many times
-// without paying the load/validate/compile cost on every request.
-//
-// This is the v0.0.x narrow shape — one flow per boot, no CRUD, no
-// persistence. A flow registry and run-history store are tracked in
-// the project's research SUMMARY as later-phase deliverables.
+// v0.0.5 adds a persistence layer: flows are stored in SQLite,
+// runs are recorded with status / outputs / error, and the full
+// REST surface (flow CRUD + per-flow runs + run-history) is wired
+// against any number of flows.
 //
 //	flowd --addr :7861 \
-//	      --flow  examples/echo_chain/flow.json \
-//	      --tools mytools.json
+//	      --db   /var/lib/flowd/flow.db   # use ":memory:" for ephemeral runs
+//	      --flow examples/echo_chain/flow.json   # optional boot-time seed + legacy /run alias
+//	      --tools mytools.json                   # optional tool manifest
 //
-// --tools is optional. When unset the bundled echo_chain demo tools
-// are used (suitable for examples/echo_chain/flow.json).
+// All flags are optional. --db defaults to ":memory:" so the binary
+// runs out-of-box. --flow, when supplied, seeds the database at boot
+// (if the flow id is not already present) AND enables the legacy
+// /run + /run/stream endpoints for v0.0.4-compatible clients.
 package main
 
 import (
@@ -34,30 +34,27 @@ import (
 	"github.com/costa92/llm-agent-flow/examples/router"
 	"github.com/costa92/llm-agent-flow/flow"
 	cond "github.com/costa92/llm-agent-flow/flow/cond/cel"
+	flowstore "github.com/costa92/llm-agent-flow/flow/store"
+	sqlitestore "github.com/costa92/llm-agent-flow/flow/store/sqlite"
 	toolspkg "github.com/costa92/llm-agent-flow/flow/tools"
 )
 
 func main() {
 	addr := flag.String("addr", ":7861", "HTTP listen address.")
-	flowPath := flag.String("flow", "", "Path to the flow JSON to serve. Required.")
-	toolsPath := flag.String("tools", "", "Path to a tool-manifest JSON (see flow/tools). When unset, the built-in echo_chain demo tools are used.")
+	dbPath := flag.String("db", ":memory:", "SQLite DSN for flow + run-history storage. \":memory:\" for ephemeral runs.")
+	flowPath := flag.String("flow", "", "Optional path to a flow JSON. Seeds the database at boot AND enables /run + /run/stream legacy aliases for that flow id.")
+	toolsPath := flag.String("tools", "", "Path to a tool-manifest JSON (see flow/tools). When unset, the built-in echo_chain + router demo tools are used.")
 	readTimeout := flag.Duration("read-timeout", 5*time.Second, "HTTP server read timeout.")
 	writeTimeout := flag.Duration("write-timeout", 0, "HTTP server write timeout (0 disables — required for SSE).")
 	maxNodeConcurrency := flag.Int("max-node-concurrency", 0, "Cap on goroutines per topological layer. 0 = unlimited.")
 	flag.Parse()
 
-	if *flowPath == "" {
-		fmt.Fprintln(os.Stderr, "flowd: --flow is required")
-		flag.Usage()
-		os.Exit(2)
-	}
-
-	f, err := os.Open(*flowPath)
+	store, err := sqlitestore.Open(*dbPath)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "flowd: open flow:", err)
+		fmt.Fprintln(os.Stderr, "flowd: open db:", err)
 		os.Exit(1)
 	}
-	defer f.Close()
+	defer store.Close()
 
 	reg := flow.NewNodeRegistry()
 	if err := flow.RegisterToolNode(reg); err != nil {
@@ -69,23 +66,41 @@ func main() {
 		fmt.Fprintln(os.Stderr, "flowd:", err)
 		os.Exit(1)
 	}
-
 	celEval, err := cond.NewEvaluator()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "flowd: cel evaluator:", err)
 		os.Exit(1)
 	}
-	engine, err := flow.LoadCompile(f, reg, flow.Deps{Tools: tools},
-		flow.WithMaxNodeConcurrency(*maxNodeConcurrency),
-		flow.WithConditionEvaluator(celEval))
+
+	legacyID := ""
+	if *flowPath != "" {
+		id, err := seedFlow(store, *flowPath)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "flowd: seed flow:", err)
+			os.Exit(1)
+		}
+		legacyID = id
+		log.Printf("flowd: seeded flow %q from %s", id, *flowPath)
+	}
+
+	srvCfg := server.Config{
+		Store:              store,
+		Registry:           reg,
+		Tools:              tools,
+		Cond:               celEval,
+		MaxNodeConcurrency: *maxNodeConcurrency,
+		Logger:             log.Default(),
+		LegacyFlowID:       legacyID,
+	}
+	flowdServer, err := server.New(srvCfg)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "flowd:", err)
 		os.Exit(1)
 	}
 
-	srv := &http.Server{
+	httpSrv := &http.Server{
 		Addr:         *addr,
-		Handler:      server.NewMux(engine, log.Default()),
+		Handler:      flowdServer.Handler(),
 		ReadTimeout:  *readTimeout,
 		WriteTimeout: *writeTimeout,
 	}
@@ -94,8 +109,8 @@ func main() {
 	defer stop()
 
 	go func() {
-		log.Printf("flowd: listening on %s (flow=%s)", *addr, *flowPath)
-		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		log.Printf("flowd: listening on %s (db=%s)", *addr, *dbPath)
+		if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Printf("flowd: server: %v", err)
 			stop()
 		}
@@ -105,15 +120,14 @@ func main() {
 	log.Println("flowd: shutting down")
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if err := srv.Shutdown(shutdownCtx); err != nil {
+	if err := httpSrv.Shutdown(shutdownCtx); err != nil {
 		log.Printf("flowd: shutdown: %v", err)
 	}
 }
 
 // loadTools resolves the manifest at path into a flow.ToolMap. With
 // an empty path, fall back to the union of every bundled example's
-// demo tools so any `examples/*/flow.json` boots out-of-box. Real
-// deployments are expected to pass --tools.
+// demo tools so any `examples/*/flow.json` boots out-of-box.
 func loadTools(path string) (flow.ToolMap, error) {
 	if path == "" {
 		demo := []agents.Tool{}
@@ -137,3 +151,23 @@ func loadTools(path string) (flow.ToolMap, error) {
 	return out, nil
 }
 
+// seedFlow reads path, parses the JSON to extract the flow id, and
+// inserts (or PUT-updates) the row in store. Returns the flow id so
+// the caller can wire it as LegacyFlowID.
+func seedFlow(store flowstore.Store, path string) (string, error) {
+	body, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("open: %w", err)
+	}
+	f, err := flow.Load(bytesReader(body))
+	if err != nil {
+		return "", fmt.Errorf("parse: %w", err)
+	}
+	if f.ID == "" {
+		return "", fmt.Errorf("flow file %s has no id", path)
+	}
+	if _, err := store.PutFlow(context.Background(), f.ID, f.Name, body, false); err != nil {
+		return "", fmt.Errorf("store: %w", err)
+	}
+	return f.ID, nil
+}

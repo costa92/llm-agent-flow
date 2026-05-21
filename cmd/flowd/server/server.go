@@ -1,16 +1,18 @@
-// Package server is the HTTP layer for cmd/flowd. It is split into its
-// own package so it can be exercised by httptest without booting the
-// full flowd binary.
+// Package server is the HTTP layer for cmd/flowd. It is split into
+// its own package so it can be exercised by httptest without booting
+// the full flowd binary.
 //
-// v0.0.2 surface — one flow per server instance:
+// Two entry points:
 //
-//	GET  /healthz       → 200 "ok"
-//	POST /run           → sync; body {"inputs": {...}} → {"outputs": {...}}
-//	POST /run/stream    → SSE stream of FlowEvent JSON payloads
-//
-// A future phase will introduce flow CRUD (/flows, /flows/{id}, etc.)
-// once the run-history store lands; for now this layer wraps one
-// engine and accepts a fresh inputs map per request.
+//   - NewMux(engine, logger) — legacy, single-engine. Wires only
+//     /healthz, /run, /run/stream against the provided Engine. No
+//     CRUD, no persistence. Retained for existing callers.
+//   - New(cfg) (*Server, error) — v0.0.5 surface with a backing
+//     flow/store.Store, lazy engine cache, and the full REST shape:
+//     /flows CRUD, /flows/{id}/run + /run/stream, /flows/{id}/runs,
+//     /runs/{id}. When Config.LegacyFlowID is set, /run and
+//     /run/stream also route to that id so v0.0.4 clients keep
+//     working.
 package server
 
 import (
@@ -20,25 +22,133 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"sync"
 
 	"github.com/costa92/llm-agent-flow/flow"
+	flowstore "github.com/costa92/llm-agent-flow/flow/store"
 )
 
-// NewMux wires the v0.0.2 endpoints against a compiled Engine. The
-// supplied logger receives one line per request error.
+// NewMux is the legacy single-engine wrapper. The returned handler
+// exposes /healthz + /run + /run/stream against the supplied Engine.
+// It does not persist anything and does not expose CRUD endpoints —
+// use New(cfg) for the full v0.0.5 surface.
 func NewMux(engine *flow.Engine, logger *log.Logger) http.Handler {
 	if logger == nil {
 		logger = log.Default()
 	}
 	mux := http.NewServeMux()
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		_, _ = io.WriteString(w, "ok")
-	})
+	mux.HandleFunc("/healthz", healthHandler)
 	mux.HandleFunc("/run", runHandler(engine, logger))
 	mux.HandleFunc("/run/stream", streamHandler(engine, logger))
 	return mux
 }
+
+// Config is the input bundle for New. All fields except LegacyFlowID
+// are required.
+type Config struct {
+	Store              flowstore.Store         // persistence
+	Registry           *flow.NodeRegistry      // shared across compiled engines
+	Tools              flow.ToolMap            // tool catalog wired into every engine
+	Cond               flow.ConditionEvaluator // optional — required only for flows with conditions
+	MaxNodeConcurrency int                     // per-layer cap; 0 = unlimited
+	Logger             *log.Logger             // request-error log; defaults to log.Default
+
+	// LegacyFlowID, when non-empty, makes /run and /run/stream route
+	// to this flow id. Bootstraps the v0.0.4 single-flow workflow on
+	// top of the v0.0.5 store-backed server.
+	LegacyFlowID string
+}
+
+// Server is the v0.0.5 store-backed HTTP layer. Concurrent-safe;
+// construct once and serve forever.
+type Server struct {
+	cfg     Config
+	engines sync.Map // map[string]*flow.Engine — compiled-flow cache
+}
+
+// New returns a Server wired with the supplied Config.
+func New(cfg Config) (*Server, error) {
+	if cfg.Store == nil {
+		return nil, errors.New("flowd/server: Config.Store is required")
+	}
+	if cfg.Registry == nil {
+		return nil, errors.New("flowd/server: Config.Registry is required")
+	}
+	if cfg.Logger == nil {
+		cfg.Logger = log.Default()
+	}
+	return &Server{cfg: cfg}, nil
+}
+
+// Handler returns the HTTP handler this Server serves.
+func (s *Server) Handler() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /healthz", healthHandler)
+
+	mux.HandleFunc("POST /flows", s.handleCreateFlow)
+	mux.HandleFunc("GET /flows", s.handleListFlows)
+	mux.HandleFunc("GET /flows/{id}", s.handleGetFlow)
+	mux.HandleFunc("PUT /flows/{id}", s.handlePutFlow)
+	mux.HandleFunc("DELETE /flows/{id}", s.handleDeleteFlow)
+
+	mux.HandleFunc("POST /flows/{id}/run", s.handleRun)
+	mux.HandleFunc("POST /flows/{id}/run/stream", s.handleRunStream)
+	mux.HandleFunc("GET /flows/{id}/runs", s.handleListRunsForFlow)
+
+	mux.HandleFunc("GET /runs/{id}", s.handleGetRun)
+
+	// Legacy single-flow routes for v0.0.4 backward compat.
+	if s.cfg.LegacyFlowID != "" {
+		mux.HandleFunc("POST /run", s.handleLegacyRun)
+		mux.HandleFunc("POST /run/stream", s.handleLegacyRunStream)
+	}
+
+	return mux
+}
+
+// Close releases the engine cache. Underlying Store ownership stays
+// with the caller.
+func (s *Server) Close() {
+	s.engines.Range(func(k, _ any) bool {
+		s.engines.Delete(k)
+		return true
+	})
+}
+
+// engineFor returns the compiled Engine for id, lazily compiling +
+// caching on miss. On flow update / delete the caller MUST evict via
+// engineEvict(id).
+func (s *Server) engineFor(id string) (*flow.Engine, *flowstore.FlowRecord, error) {
+	if v, ok := s.engines.Load(id); ok {
+		return v.(*flow.Engine), nil, nil
+	}
+	rec, err := s.cfg.Store.GetFlow(serverCtxFor(s), id)
+	if err != nil {
+		return nil, nil, err
+	}
+	opts := []flow.EngineOption{flow.WithMaxNodeConcurrency(s.cfg.MaxNodeConcurrency)}
+	if s.cfg.Cond != nil {
+		opts = append(opts, flow.WithConditionEvaluator(s.cfg.Cond))
+	}
+	eng, err := flow.LoadCompile(bytesReader(rec.JSON), s.cfg.Registry, flow.Deps{Tools: s.cfg.Tools}, opts...)
+	if err != nil {
+		return nil, nil, err
+	}
+	actual, _ := s.engines.LoadOrStore(id, eng)
+	return actual.(*flow.Engine), &rec, nil
+}
+
+func (s *Server) engineEvict(id string) { s.engines.Delete(id) }
+
+// healthHandler is shared between legacy NewMux and New.Handler.
+func healthHandler(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	_, _ = io.WriteString(w, "ok")
+}
+
+// ----------------------------------------------------------------------
+// Legacy single-engine handlers (NewMux path)
+// ----------------------------------------------------------------------
 
 type runRequest struct {
 	Inputs map[string]string `json:"inputs"`
@@ -46,6 +156,7 @@ type runRequest struct {
 
 type runResponse struct {
 	Outputs map[string]string `json:"outputs"`
+	RunID   string            `json:"run_id,omitempty"`
 }
 
 type errorResponse struct {
@@ -84,36 +195,328 @@ func streamHandler(engine *flow.Engine, logger *log.Logger) http.HandlerFunc {
 			writeError(w, http.StatusBadRequest, fmt.Errorf("decode body: %w", err))
 			return
 		}
+		runSSE(w, r, engine, req.Inputs, "", nil, logger)
+	}
+}
 
-		flusher, ok := w.(http.Flusher)
-		if !ok {
-			writeError(w, http.StatusInternalServerError, errors.New("response writer does not support streaming"))
+// ----------------------------------------------------------------------
+// v0.0.5 store-backed handlers (New(cfg).Handler() path)
+// ----------------------------------------------------------------------
+
+type createFlowRequest struct {
+	ID   string          `json:"id"`
+	Name string          `json:"name,omitempty"`
+	Flow json.RawMessage `json:"flow"`
+}
+
+func (s *Server) handleCreateFlow(w http.ResponseWriter, r *http.Request) {
+	var req createFlowRequest
+	if err := decodeJSON(r.Body, &req); err != nil {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("decode body: %w", err))
+		return
+	}
+	id, name, body, ferr := flowHeaderFromBody(req.ID, req.Name, req.Flow)
+	if ferr != nil {
+		writeError(w, http.StatusBadRequest, ferr)
+		return
+	}
+	if cerr := s.compileProbe(body); cerr != nil {
+		writeError(w, http.StatusBadRequest, cerr)
+		return
+	}
+	rec, err := s.cfg.Store.PutFlow(r.Context(), id, name, body, true)
+	if errors.Is(err, flowstore.ErrAlreadyExists) {
+		writeError(w, http.StatusConflict, fmt.Errorf("flow %q already exists", id))
+		return
+	}
+	if err != nil {
+		s.cfg.Logger.Printf("flowd: POST /flows: %v", err)
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, rec)
+}
+
+func (s *Server) handlePutFlow(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	var req createFlowRequest
+	if err := decodeJSON(r.Body, &req); err != nil {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("decode body: %w", err))
+		return
+	}
+	// PUT URL is the source of truth; if a body id is supplied and
+	// it disagrees, reject so the caller doesn't silently overwrite
+	// the wrong row.
+	if req.ID != "" && req.ID != id {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("body id %q does not match URL id %q", req.ID, id))
+		return
+	}
+	if len(req.Flow) == 0 {
+		writeError(w, http.StatusBadRequest, errors.New("flow field is required"))
+		return
+	}
+	if cerr := s.compileProbe(req.Flow); cerr != nil {
+		writeError(w, http.StatusBadRequest, cerr)
+		return
+	}
+	name := req.Name
+	if name == "" {
+		_, name, _, _ = flowHeaderFromBody(id, "", req.Flow)
+	}
+	rec, err := s.cfg.Store.PutFlow(r.Context(), id, name, req.Flow, false)
+	if err != nil {
+		s.cfg.Logger.Printf("flowd: PUT /flows/%s: %v", id, err)
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	s.engineEvict(id)
+	writeJSON(w, http.StatusOK, rec)
+}
+
+func (s *Server) handleListFlows(w http.ResponseWriter, r *http.Request) {
+	flows, err := s.cfg.Store.ListFlows(r.Context(), 0)
+	if err != nil {
+		s.cfg.Logger.Printf("flowd: GET /flows: %v", err)
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"flows": flows})
+}
+
+func (s *Server) handleGetFlow(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	rec, err := s.cfg.Store.GetFlow(r.Context(), id)
+	if errors.Is(err, flowstore.ErrNotFound) {
+		writeError(w, http.StatusNotFound, fmt.Errorf("flow %q not found", id))
+		return
+	}
+	if err != nil {
+		s.cfg.Logger.Printf("flowd: GET /flows/%s: %v", id, err)
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, rec)
+}
+
+func (s *Server) handleDeleteFlow(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if err := s.cfg.Store.DeleteFlow(r.Context(), id); err != nil {
+		if errors.Is(err, flowstore.ErrNotFound) {
+			writeError(w, http.StatusNotFound, fmt.Errorf("flow %q not found", id))
 			return
 		}
-		w.Header().Set("Content-Type", "text/event-stream")
-		w.Header().Set("Cache-Control", "no-cache")
-		w.Header().Set("X-Accel-Buffering", "no") // disable nginx buffering
-		w.WriteHeader(http.StatusOK)
+		s.cfg.Logger.Printf("flowd: DELETE /flows/%s: %v", id, err)
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	s.engineEvict(id)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	s.runWithStore(w, r, id, false)
+}
+
+func (s *Server) handleRunStream(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	s.runWithStore(w, r, id, true)
+}
+
+func (s *Server) handleLegacyRun(w http.ResponseWriter, r *http.Request) {
+	s.runWithStore(w, r, s.cfg.LegacyFlowID, false)
+}
+
+func (s *Server) handleLegacyRunStream(w http.ResponseWriter, r *http.Request) {
+	s.runWithStore(w, r, s.cfg.LegacyFlowID, true)
+}
+
+// runWithStore is the unified entry for /flows/{id}/run and
+// /flows/{id}/run/stream (plus the legacy aliases). It resolves the
+// engine, records the run, executes, and persists the outcome.
+func (s *Server) runWithStore(w http.ResponseWriter, r *http.Request, flowID string, stream bool) {
+	var req runRequest
+	if err := decodeJSON(r.Body, &req); err != nil {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("decode body: %w", err))
+		return
+	}
+	eng, _, err := s.engineFor(flowID)
+	if errors.Is(err, flowstore.ErrNotFound) {
+		writeError(w, http.StatusNotFound, fmt.Errorf("flow %q not found", flowID))
+		return
+	}
+	if err != nil {
+		s.cfg.Logger.Printf("flowd: engineFor %q: %v", flowID, err)
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	runID, serr := s.cfg.Store.StartRun(r.Context(), flowID, req.Inputs)
+	if serr != nil {
+		s.cfg.Logger.Printf("flowd: StartRun: %v", serr)
+		writeError(w, http.StatusInternalServerError, serr)
+		return
+	}
+	w.Header().Set("X-Run-ID", runID)
+
+	if stream {
+		runSSE(w, r, eng, req.Inputs, runID, func(outputs map[string]string, runErr error) {
+			s.persistFinish(runID, outputs, runErr)
+		}, s.cfg.Logger)
+		return
+	}
+
+	outputs, runErr := eng.Run(r.Context(), req.Inputs)
+	s.persistFinish(runID, outputs, runErr)
+	if runErr != nil {
+		s.cfg.Logger.Printf("flowd: /flows/%s/run: %v", flowID, runErr)
+		writeError(w, statusForError(runErr), runErr)
+		return
+	}
+	writeJSON(w, http.StatusOK, runResponse{Outputs: outputs, RunID: runID})
+}
+
+func (s *Server) persistFinish(runID string, outputs map[string]string, runErr error) {
+	msg := ""
+	if runErr != nil {
+		msg = runErr.Error()
+		outputs = nil
+	}
+	if err := s.cfg.Store.FinishRun(serverCtxFor(s), runID, outputs, msg); err != nil {
+		s.cfg.Logger.Printf("flowd: FinishRun %s: %v", runID, err)
+	}
+}
+
+func (s *Server) handleGetRun(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	rec, err := s.cfg.Store.GetRun(r.Context(), id)
+	if errors.Is(err, flowstore.ErrNotFound) {
+		writeError(w, http.StatusNotFound, fmt.Errorf("run %q not found", id))
+		return
+	}
+	if err != nil {
+		s.cfg.Logger.Printf("flowd: GET /runs/%s: %v", id, err)
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, rec)
+}
+
+func (s *Server) handleListRunsForFlow(w http.ResponseWriter, r *http.Request) {
+	flowID := r.PathValue("id")
+	runs, err := s.cfg.Store.ListRuns(r.Context(), flowID, 0)
+	if err != nil {
+		s.cfg.Logger.Printf("flowd: GET /flows/%s/runs: %v", flowID, err)
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"runs": runs})
+}
+
+// ----------------------------------------------------------------------
+// Shared helpers
+// ----------------------------------------------------------------------
+
+// runSSE runs an engine in streaming mode and forwards FlowEvents to
+// the client as SSE frames. The caller is responsible for decoding
+// the request body; inputs is passed through to engine.RunStream.
+// onFinish (optional) is called once after the terminal event with
+// the final outputs / error so the store can persist the outcome.
+func runSSE(
+	w http.ResponseWriter,
+	r *http.Request,
+	engine *flow.Engine,
+	inputs map[string]string,
+	runID string,
+	onFinish func(outputs map[string]string, runErr error),
+	logger *log.Logger,
+) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeError(w, http.StatusInternalServerError, errors.New("response writer does not support streaming"))
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("X-Accel-Buffering", "no")
+	if runID != "" {
+		w.Header().Set("X-Run-ID", runID)
+	}
+	w.WriteHeader(http.StatusOK)
+	flusher.Flush()
+
+	ch, err := engine.RunStream(r.Context(), inputs)
+	if err != nil {
+		writeSSE(w, "flow_err", map[string]string{"error": err.Error()})
 		flusher.Flush()
-
-		ch, err := engine.RunStream(r.Context(), req.Inputs)
-		if err != nil {
-			// rare — RunStream only errors on configuration. Encode it
-			// as one terminal event so the client can detect it.
-			writeSSE(w, "flow_err", map[string]string{"error": err.Error()})
-			flusher.Flush()
-			return
+		if onFinish != nil {
+			onFinish(nil, err)
 		}
-		for ev := range ch {
-			payload := streamPayload(ev)
-			writeSSE(w, eventKindString(ev.Kind), payload)
-			flusher.Flush()
-			if ev.Kind == flow.FlowErr {
-				logger.Printf("flowd: /run/stream: %v", ev.Err)
-				return
-			}
+		return
+	}
+	var (
+		finalOutputs map[string]string
+		finalErr     error
+	)
+	for ev := range ch {
+		payload := streamPayload(ev)
+		writeSSE(w, eventKindString(ev.Kind), payload)
+		flusher.Flush()
+		switch ev.Kind {
+		case flow.FlowDone:
+			finalOutputs = ev.Outputs
+		case flow.FlowErr:
+			finalErr = ev.Err
+			logger.Printf("flowd: /run/stream: %v", ev.Err)
 		}
 	}
+	if onFinish != nil {
+		onFinish(finalOutputs, finalErr)
+	}
+}
+
+// flowHeaderFromBody picks the canonical id/name (URL id wins; URL
+// name wins if non-empty; otherwise both fall back to the flow body's
+// own fields) and ensures the flow JSON body's id agrees with the
+// chosen value.
+func flowHeaderFromBody(reqID, reqName string, body json.RawMessage) (string, string, json.RawMessage, error) {
+	if len(body) == 0 {
+		return "", "", nil, errors.New("flow field is required")
+	}
+	var head struct {
+		ID   string `json:"id"`
+		Name string `json:"name"`
+	}
+	if err := json.Unmarshal(body, &head); err != nil {
+		return "", "", nil, fmt.Errorf("flow head: %w", err)
+	}
+	id := reqID
+	if id == "" {
+		id = head.ID
+	}
+	if id == "" {
+		return "", "", nil, errors.New("missing flow id (set top-level \"id\" or include in body)")
+	}
+	if head.ID != "" && head.ID != id {
+		return "", "", nil, fmt.Errorf("body's flow.id %q does not match outer id %q", head.ID, id)
+	}
+	name := reqName
+	if name == "" {
+		name = head.Name
+	}
+	return id, name, body, nil
+}
+
+// compileProbe parses + validates + compiles a flow body to surface
+// configuration errors at POST/PUT time rather than at run time.
+func (s *Server) compileProbe(body []byte) error {
+	opts := []flow.EngineOption{flow.WithMaxNodeConcurrency(s.cfg.MaxNodeConcurrency)}
+	if s.cfg.Cond != nil {
+		opts = append(opts, flow.WithConditionEvaluator(s.cfg.Cond))
+	}
+	if _, err := flow.LoadCompile(bytesReader(body), s.cfg.Registry, flow.Deps{Tools: s.cfg.Tools}, opts...); err != nil {
+		return fmt.Errorf("flow compile: %w", err)
+	}
+	return nil
 }
 
 func decodeJSON(r io.Reader, v any) error {
@@ -132,13 +535,6 @@ func writeError(w http.ResponseWriter, status int, err error) {
 	writeJSON(w, status, errorResponse{Error: err.Error()})
 }
 
-// writeSSE writes a single Server-Sent Events frame:
-//
-//	event: <kind>
-//	data: <json>
-//
-// followed by the required blank line. Caller must Flush() between
-// frames if it wants real streaming.
 func writeSSE(w io.Writer, kind string, data any) {
 	raw, _ := json.Marshal(data)
 	_, _ = fmt.Fprintf(w, "event: %s\ndata: %s\n\n", kind, raw)
@@ -163,9 +559,6 @@ func eventKindString(k flow.FlowEventKind) string {
 	}
 }
 
-// streamPayload reshapes a FlowEvent into the JSON shape sent in SSE
-// data frames. We omit the Kind field (it's the SSE event: name) and
-// the always-empty *Map fields for that variant.
 func streamPayload(ev flow.FlowEvent) map[string]any {
 	m := map[string]any{}
 	if ev.FlowID != "" {
@@ -189,9 +582,6 @@ func streamPayload(ev flow.FlowEvent) map[string]any {
 	return m
 }
 
-// statusForError maps the few error shapes /run can return into HTTP
-// status codes. Validation / missing-input errors → 400; everything
-// else → 500.
 func statusForError(err error) int {
 	if err == nil {
 		return http.StatusOK
@@ -203,8 +593,6 @@ func statusForError(err error) int {
 	if errors.Is(err, flow.ErrEmptyFlow) {
 		return http.StatusBadRequest
 	}
-	// missing input / port-not-emitted errors come back as plain fmt-
-	// wrapped errors from engine.run. They are caller-faults.
 	msg := err.Error()
 	for _, hint := range []string{"missing required input", "awaits port", "awaits"} {
 		if contains(msg, hint) {
