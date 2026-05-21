@@ -34,7 +34,7 @@ invoke a flow).
 provisional and may change between v0.0.x tags. SemVer stability
 begins at v0.1.0.
 
-Implemented (v0.0.5):
+Implemented (v0.0.6):
 
 - Flow / Node / Edge / Port Go types with JSON round-trip
 - `Load(r io.Reader) (Flow, error)`
@@ -90,15 +90,23 @@ Implemented (v0.0.5):
     persisted on stream close.
   - `GET /flows/{id}/runs` — list runs for a flow.
   - `GET /runs/{id}` — full run record (inputs / outputs / error).
+  - `GET /runs/{id}/events` — full ordered FlowEvent history for a
+    run (every flow_started / node_started / node_finished /
+    node_skipped / flow_done / flow_err frame, with payloads).
   - `POST /run`, `POST /run/stream` — legacy aliases against the seed
     flow set by `--flow`. v0.0.4 clients keep working.
+- **Every FlowEvent is persisted.** Both sync and stream runs drive
+  the engine through `RunStream` internally; every event lands in
+  `run_events` before being forwarded (in stream mode) to the SSE
+  client. A client that drops mid-stream still leaves a complete
+  audit trail in the store.
 
 Deferred to next phases:
 
-- per-event run-history persistence (currently only start/finish are
-  stored; intermediate FlowEvents are stream-only)
 - `otelflow.Wrap(Engine) Engine` decorator (in `llm-agent-otel`)
 - AuthN / authZ on the HTTP API (no auth at v0.0.x)
+- Replay endpoint (`POST /runs/{id}/replay` that re-streams the
+  persisted events to a new client)
 
 ## Quick start
 
@@ -154,6 +162,16 @@ curl http://localhost:7861/flows/echo_chain/runs
 curl http://localhost:7861/runs/4351cce92d54ba5d
 # {"id":"4351cce92d54ba5d","status":"done","inputs":{"in":"hello"},
 #  "outputs":{"out":"OLLEH"},...}
+
+# Fetch the per-event audit log for a run.
+curl http://localhost:7861/runs/4351cce92d54ba5d/events
+# {"events":[
+#   {"seq":1,"kind":"flow_started",  "payload":{"flow":"echo_chain"}, "ts":"..."},
+#   {"seq":2,"kind":"node_started",  "node_id":"upper",   ...},
+#   {"seq":3,"kind":"node_finished", "node_id":"upper",   "payload":{"output":{...}}, ...},
+#   ...
+#   {"seq":6,"kind":"flow_done",     "payload":{"outputs":{"out":"OLLEH"}}, "ts":"..."}
+# ]}
 
 # SSE-stream a run.
 curl -X POST http://localhost:7861/flows/echo_chain/run/stream \

@@ -71,6 +71,19 @@ CREATE TABLE IF NOT EXISTS runs (
 
 CREATE INDEX IF NOT EXISTS idx_runs_flow_id_started_at
   ON runs(flow_id, started_at DESC);
+
+CREATE TABLE IF NOT EXISTS run_events (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id       TEXT NOT NULL,
+  seq          INTEGER NOT NULL,
+  kind         TEXT NOT NULL,
+  node_id      TEXT,
+  payload_json TEXT,
+  ts           INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_run_events_run_id_seq
+  ON run_events(run_id, seq);
 `
 	if _, err := s.db.ExecContext(ctx, ddl); err != nil {
 		return fmt.Errorf("flow/store/sqlite: ensure schema: %w", err)

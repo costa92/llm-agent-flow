@@ -96,6 +96,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /flows/{id}/runs", s.handleListRunsForFlow)
 
 	mux.HandleFunc("GET /runs/{id}", s.handleGetRun)
+	mux.HandleFunc("GET /runs/{id}/events", s.handleListRunEvents)
 
 	// Legacy single-flow routes for v0.0.4 backward compat.
 	if s.cfg.LegacyFlowID != "" {
@@ -332,8 +333,11 @@ func (s *Server) handleLegacyRunStream(w http.ResponseWriter, r *http.Request) {
 }
 
 // runWithStore is the unified entry for /flows/{id}/run and
-// /flows/{id}/run/stream (plus the legacy aliases). It resolves the
-// engine, records the run, executes, and persists the outcome.
+// /flows/{id}/run/stream (plus the legacy aliases). Regardless of
+// the `stream` bool, the engine is driven through RunStream so every
+// FlowEvent can be persisted to flow/store; the bool only controls
+// whether those events are also forwarded to the HTTP client as SSE
+// frames.
 func (s *Server) runWithStore(w http.ResponseWriter, r *http.Request, flowID string, stream bool) {
 	var req runRequest
 	if err := decodeJSON(r.Body, &req); err != nil {
@@ -358,21 +362,90 @@ func (s *Server) runWithStore(w http.ResponseWriter, r *http.Request, flowID str
 	}
 	w.Header().Set("X-Run-ID", runID)
 
+	var flusher http.Flusher
 	if stream {
-		runSSE(w, r, eng, req.Inputs, runID, func(outputs map[string]string, runErr error) {
-			s.persistFinish(runID, outputs, runErr)
-		}, s.cfg.Logger)
+		var ok bool
+		flusher, ok = w.(http.Flusher)
+		if !ok {
+			writeError(w, http.StatusInternalServerError, errors.New("response writer does not support streaming"))
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("X-Accel-Buffering", "no")
+		w.WriteHeader(http.StatusOK)
+		flusher.Flush()
+	}
+
+	ch, err := eng.RunStream(r.Context(), req.Inputs)
+	if err != nil {
+		// Configuration-level error before the engine started. Record
+		// it as the lone event so the run history is coherent, mark
+		// the run failed, and surface to the client appropriately.
+		_ = s.cfg.Store.AppendRunEvent(serverCtxFor(s), runID,
+			flowstore.RunEventFlowErr, "", mustJSON(map[string]string{"error": err.Error()}))
+		s.persistFinish(runID, nil, err)
+		if stream {
+			writeSSE(w, "flow_err", map[string]string{"error": err.Error()})
+			flusher.Flush()
+			return
+		}
+		writeError(w, statusForError(err), err)
 		return
 	}
 
-	outputs, runErr := eng.Run(r.Context(), req.Inputs)
-	s.persistFinish(runID, outputs, runErr)
-	if runErr != nil {
-		s.cfg.Logger.Printf("flowd: /flows/%s/run: %v", flowID, runErr)
-		writeError(w, statusForError(runErr), runErr)
+	var (
+		finalOutputs map[string]string
+		finalErr     error
+	)
+	for ev := range ch {
+		payload := streamPayload(ev)
+		payloadRaw := mustJSON(payload)
+
+		// Persist FIRST so events outlive a client that drops the
+		// connection mid-stream. AppendRunEvent failures are logged
+		// but do not abort the run.
+		if perr := s.cfg.Store.AppendRunEvent(serverCtxFor(s), runID,
+			flowstore.RunEventKind(eventKindString(ev.Kind)), ev.NodeID, payloadRaw); perr != nil {
+			s.cfg.Logger.Printf("flowd: AppendRunEvent %s: %v", runID, perr)
+		}
+
+		if stream {
+			writeSSE(w, eventKindString(ev.Kind), payload)
+			flusher.Flush()
+		}
+
+		switch ev.Kind {
+		case flow.FlowDone:
+			finalOutputs = ev.Outputs
+		case flow.FlowErr:
+			finalErr = ev.Err
+			s.cfg.Logger.Printf("flowd: /flows/%s/run: %v", flowID, ev.Err)
+		}
+	}
+
+	s.persistFinish(runID, finalOutputs, finalErr)
+
+	if stream {
+		return // SSE body already complete
+	}
+	if finalErr != nil {
+		writeError(w, statusForError(finalErr), finalErr)
 		return
 	}
-	writeJSON(w, http.StatusOK, runResponse{Outputs: outputs, RunID: runID})
+	writeJSON(w, http.StatusOK, runResponse{Outputs: finalOutputs, RunID: runID})
+}
+
+// mustJSON marshals v and returns the bytes. Errors are unreachable
+// for the types we feed it (map[string]any built from streamPayload),
+// but if json.Marshal does fail we fall back to a literal "null" so
+// the caller never sees a nil payload that the store would reject.
+func mustJSON(v any) []byte {
+	raw, err := json.Marshal(v)
+	if err != nil || len(raw) == 0 {
+		return []byte("null")
+	}
+	return raw
 }
 
 func (s *Server) persistFinish(runID string, outputs map[string]string, runErr error) {
@@ -399,6 +472,21 @@ func (s *Server) handleGetRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, rec)
+}
+
+func (s *Server) handleListRunEvents(w http.ResponseWriter, r *http.Request) {
+	runID := r.PathValue("id")
+	events, err := s.cfg.Store.ListRunEvents(r.Context(), runID, 0)
+	if errors.Is(err, flowstore.ErrNotFound) {
+		writeError(w, http.StatusNotFound, fmt.Errorf("run %q not found", runID))
+		return
+	}
+	if err != nil {
+		s.cfg.Logger.Printf("flowd: GET /runs/%s/events: %v", runID, err)
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"events": events})
 }
 
 func (s *Server) handleListRunsForFlow(w http.ResponseWriter, r *http.Request) {

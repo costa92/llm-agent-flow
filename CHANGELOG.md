@@ -5,6 +5,61 @@ All notable changes to `github.com/costa92/llm-agent-flow` are documented here.
 <!-- Keep a Changelog: https://keepachangelog.com/en/1.1.0/ -->
 <!-- Semver: https://semver.org/ — note: v0.0.x is provisional. -->
 
+## [v0.0.6] - 2026-05-21
+
+Phase 6 — Per-event run-history persistence.
+
+v0.0.5 only stored start/finish for each run. This release captures
+every FlowEvent — flow_started, node_started, node_finished,
+node_skipped, flow_done, flow_err — with timestamps and payloads, so
+the run history reflects what actually happened inside the engine,
+not just the final outcome.
+
+### Added
+
+- **`flow/store.RunEvent` type** + `RunEventKind` enum
+  (`flow_started`, `node_started`, `node_finished`, `node_skipped`,
+  `flow_done`, `flow_err`). String values match the SSE event names
+  so a replay client can reuse the existing decoder.
+- **Store interface extensions:** `AppendRunEvent` +
+  `ListRunEvents`. Append is safe to call on finished runs and on
+  unknown runs (the latter returns `ErrNotFound`).
+- **SQLite implementation:** new `run_events` table with
+  `(run_id, seq)` index. `seq` is assigned server-side as
+  `max(existing) + 1` per run for a single-statement race-free
+  monotonic ordering. Schema is idempotent — existing v0.0.5
+  databases pick up the new table on next `Open`.
+- **flowd unifies sync and stream paths through `engine.RunStream`.**
+  Whether the client wants a JSON response or SSE, every event is
+  persisted to the store BEFORE being forwarded to the client. A
+  consumer that drops mid-stream still leaves a complete audit trail.
+- **`GET /runs/{id}/events`** — ordered event log for a run with
+  full payloads. Unknown ids return an empty list (idempotent for
+  replay-style clients).
+
+### Tests
+
+- `flow/store/sqlite/events_test.go` (7 cases): append + list
+  round-trip with payload JSON decode, empty case, unknown-run
+  returns ErrNotFound, nil-payload stored as empty, limit honored,
+  events survive flow delete, empty run_id rejected.
+- `cmd/flowd/server/server_events_test.go` (6 cases): sync run
+  persists every event, stream run persists AND streams, GET
+  /runs/{id}/events endpoint, failed-run includes flow_err with
+  error payload, router includes node_skipped, missing-run GET
+  returns empty list.
+
+13 new test cases; 93 tests overall — all green.
+
+Live smoke confirmed: a sync echo_chain run produces 6 ordered
+events in the store (`flow_started` → `node_started/finished × 2`
+→ `flow_done`) with per-node input/output payloads and
+microsecond-precision timestamps.
+
+No public API removal. The `Store` interface gains two methods; any
+v0.0.5 implementation must add them — the bundled SQLite store
+handles them automatically.
+
 ## [v0.0.5] - 2026-05-21
 
 Phase 5 — Run history (SQLite) + flow CRUD endpoints. The most

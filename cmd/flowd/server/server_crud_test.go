@@ -10,8 +10,10 @@ import (
 	"strings"
 	"testing"
 
+	agents "github.com/costa92/llm-agent"
 	"github.com/costa92/llm-agent-flow/cmd/flowd/server"
 	"github.com/costa92/llm-agent-flow/examples/echo_chain"
+	"github.com/costa92/llm-agent-flow/examples/router"
 	"github.com/costa92/llm-agent-flow/flow"
 	cond "github.com/costa92/llm-agent-flow/flow/cond/cel"
 	flowstore "github.com/costa92/llm-agent-flow/flow/store"
@@ -47,7 +49,10 @@ func newStoreServer(t *testing.T, opts ...serverOption) (*httptest.Server, flows
 	if err := flow.RegisterToolNode(reg); err != nil {
 		t.Fatalf("RegisterToolNode: %v", err)
 	}
-	tools := flow.FromAgentTools(echochain.Tools())
+	demo := []agents.Tool{}
+	demo = append(demo, echochain.Tools()...)
+	demo = append(demo, router.Tools()...)
+	tools := flow.FromAgentTools(demo)
 	celEval, err := cond.NewEvaluator()
 	if err != nil {
 		t.Fatalf("cel: %v", err)
