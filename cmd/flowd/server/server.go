@@ -103,6 +103,7 @@ func (s *Server) Handler() http.Handler {
 
 	mux.HandleFunc("GET /runs/{id}", s.handleGetRun)
 	mux.HandleFunc("GET /runs/{id}/events", s.handleListRunEvents)
+	mux.HandleFunc("POST /runs/{id}/replay", s.handleReplayRun)
 
 	// Legacy single-flow routes for v0.0.4 backward compat.
 	if s.cfg.LegacyFlowID != "" {
@@ -480,6 +481,53 @@ func (s *Server) handleGetRun(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, rec)
 }
 
+// handleReplayRun re-streams a run's persisted events as a fresh SSE
+// session. No new engine run is started; the response is a literal
+// replay of run_events for the given runID. Useful for clients that
+// connected too late to the original /run/stream, for debugging
+// reproductions, or for UIs that "scrub through" a recorded run.
+//
+// Unknown run id → 404. Empty event log → 200 with no SSE frames
+// (idempotent for just-created or never-event'd runs).
+func (s *Server) handleReplayRun(w http.ResponseWriter, r *http.Request) {
+	runID := r.PathValue("id")
+	if _, err := s.cfg.Store.GetRun(r.Context(), runID); err != nil {
+		if errors.Is(err, flowstore.ErrNotFound) {
+			writeError(w, http.StatusNotFound, fmt.Errorf("run %q not found", runID))
+			return
+		}
+		s.cfg.Logger.Printf("flowd: POST /runs/%s/replay: %v", runID, err)
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	events, err := s.cfg.Store.ListRunEvents(r.Context(), runID, 0)
+	if err != nil {
+		s.cfg.Logger.Printf("flowd: replay list events %s: %v", runID, err)
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeError(w, http.StatusInternalServerError, errors.New("response writer does not support streaming"))
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("X-Accel-Buffering", "no")
+	w.Header().Set("X-Run-ID", runID)
+	w.Header().Set("X-Replay", "true")
+	w.WriteHeader(http.StatusOK)
+	flusher.Flush()
+
+	for _, ev := range events {
+		writeSSERaw(w, string(ev.Kind), ev.Payload)
+		flusher.Flush()
+		if err := r.Context().Err(); err != nil {
+			return
+		}
+	}
+}
+
 func (s *Server) handleListRunEvents(w http.ResponseWriter, r *http.Request) {
 	runID := r.PathValue("id")
 	events, err := s.cfg.Store.ListRunEvents(r.Context(), runID, 0)
@@ -632,6 +680,15 @@ func writeError(w http.ResponseWriter, status int, err error) {
 func writeSSE(w io.Writer, kind string, data any) {
 	raw, _ := json.Marshal(data)
 	_, _ = fmt.Fprintf(w, "event: %s\ndata: %s\n\n", kind, raw)
+}
+
+// writeSSERaw emits an SSE frame with an already-encoded JSON payload.
+// Used by the replay endpoint to forward stored payloads byte-for-byte.
+func writeSSERaw(w io.Writer, kind string, data []byte) {
+	if len(data) == 0 {
+		data = []byte("null")
+	}
+	_, _ = fmt.Fprintf(w, "event: %s\ndata: %s\n\n", kind, data)
 }
 
 func eventKindString(k flow.FlowEventKind) string {
