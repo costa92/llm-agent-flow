@@ -2,7 +2,7 @@ name: pr-governance
 
 on:
   pull_request_target:
-    types: [opened, reopened, synchronize, ready_for_review]
+    types: [opened, reopened, synchronize, ready_for_review, closed]
   pull_request_review:
     types: [submitted, dismissed, edited]
 
@@ -16,6 +16,7 @@ concurrency:
 
 jobs:
   governance:
+    if: github.event_name != 'pull_request_target' || github.event.action != 'closed'
     runs-on: ubuntu-latest
     steps:
       - name: Evaluate governance policy
@@ -67,6 +68,7 @@ jobs:
           exit 1
 
   auto-merge-owner:
+    if: github.event_name != 'pull_request_target' || github.event.action != 'closed'
     needs: governance
     runs-on: ubuntu-latest
     permissions:
@@ -131,3 +133,32 @@ jobs:
           fi
 
           gh api -X DELETE "repos/$REPO/git/refs/heads/$head_ref" || true
+
+  cleanup-merged-branch:
+    if: github.event_name == 'pull_request_target' && github.event.action == 'closed' && github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: read
+    steps:
+      - name: Delete merged owner branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.owner.login }}
+        run: |
+          default_branch=$(gh repo view "$REPO" --json defaultBranchRef --jq '.defaultBranchRef.name')
+          repo_owner=${REPO%%/*}
+
+          if [ "$HEAD_REPO" != "$repo_owner" ]; then
+            echo "Skip deleting fork branch $HEAD_REPO:$HEAD_REF"
+            exit 0
+          fi
+
+          if [ "$HEAD_REF" = "$default_branch" ]; then
+            echo "Skip deleting default branch $HEAD_REF"
+            exit 0
+          fi
+
+          gh api -X DELETE "repos/$REPO/git/refs/heads/$HEAD_REF" || true
