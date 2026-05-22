@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -39,11 +40,35 @@ func Open(dsn string) (*Store, error) {
 		db.SetMaxOpenConns(1)
 	}
 	s := &Store{db: db}
+	if err := s.configurePragmas(context.Background(), dsn); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 	if err := s.ensureSchema(context.Background()); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
 	return s, nil
+}
+
+func (s *Store) configurePragmas(ctx context.Context, dsn string) error {
+	if isMemoryDSN(dsn) {
+		return nil
+	}
+	if _, err := s.db.ExecContext(ctx, `PRAGMA journal_mode=WAL`); err != nil {
+		return fmt.Errorf("flow/store/sqlite: enable WAL: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx, `PRAGMA synchronous=NORMAL`); err != nil {
+		return fmt.Errorf("flow/store/sqlite: set synchronous=NORMAL: %w", err)
+	}
+	return nil
+}
+
+func isMemoryDSN(dsn string) bool {
+	if dsn == ":memory:" {
+		return true
+	}
+	return strings.Contains(strings.ToLower(dsn), "mode=memory")
 }
 
 // ensureSchema creates tables if they do not already exist. Safe to
