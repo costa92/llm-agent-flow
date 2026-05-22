@@ -270,16 +270,35 @@ func (e *Engine) run(ctx context.Context, inputs map[string]string, ch chan<- Fl
 			layerIDs = append(layerIDs, nodeID)
 			tasks = append(tasks, func(taskCtx context.Context) (map[string]string, error) {
 				emit(FlowEvent{Kind: NodeStarted, NodeID: nodeID, Input: cloneStrMap(in)})
-				out, err := node.Run(taskCtx, in)
+				// Optional MetadataAware capability: detected per
+				// invocation so any NodeKind can opt in later without
+				// touching the registry. Nodes that don't implement
+				// it run through NodeKind.Run unchanged and emit
+				// NodeFinished with Metadata == nil. Metadata is
+				// cloned before emit so the node's internal map
+				// cannot race with consumers (mirrors the Output
+				// clone).
+				var (
+					out  map[string]string
+					meta map[string]string
+					err  error
+				)
+				if ma, ok := node.(MetadataAware); ok {
+					out, meta, err = ma.RunWithMetadata(taskCtx, in)
+				} else {
+					out, err = node.Run(taskCtx, in)
+				}
 				if err != nil {
 					wrapped := fmt.Errorf("flow: run: node %q: %w", nodeID, err)
-					emit(FlowEvent{Kind: NodeFinished, NodeID: nodeID, Err: wrapped})
+					// D1: error-path metadata is preserved so traces
+					// keep signal (HTTP 500 status, exec exit code).
+					emit(FlowEvent{Kind: NodeFinished, NodeID: nodeID, Err: wrapped, Metadata: cloneStrMap(meta)})
 					return nil, wrapped
 				}
 				for k, v := range out {
 					setPort(nodeID, k, v)
 				}
-				emit(FlowEvent{Kind: NodeFinished, NodeID: nodeID, Output: cloneStrMap(out)})
+				emit(FlowEvent{Kind: NodeFinished, NodeID: nodeID, Output: cloneStrMap(out), Metadata: cloneStrMap(meta)})
 				return out, nil
 			})
 		}
