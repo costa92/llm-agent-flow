@@ -61,6 +61,9 @@ func main() {
 		os.Exit(1)
 	}
 	defer store.Close()
+	if *dbPath != ":memory:" {
+		log.Printf("flowd: sqlite WAL mode active for %s (expect %s-wal and %s-shm sidecar files; include them in backups)", *dbPath, *dbPath, *dbPath)
+	}
 
 	reg := flow.NewNodeRegistry()
 	if err := flow.RegisterToolNode(reg); err != nil {
