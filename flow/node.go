@@ -25,6 +25,26 @@ type NodeKind interface {
 	Run(ctx context.Context, in map[string]string) (map[string]string, error)
 }
 
+// MetadataAware is an OPTIONAL capability sibling to NodeKind. Nodes
+// that implement it can publish key/value metadata alongside their
+// outputs (e.g. HTTP status code, exec exit code, LLM token usage).
+//
+// The engine type-asserts every node against MetadataAware on each
+// invocation; nodes that don't implement it run via NodeKind.Run as
+// before and emit a FlowEvent with Metadata == nil. This means
+// MetadataAware can be added to any existing NodeKind implementation
+// without breaking compilation or behavior.
+//
+// MetadataAware will remain optional throughout v0.1.x; it will NOT
+// be promoted to a required NodeKind method before v0.2.
+//
+// Implementations MUST also implement NodeKind.Run (typically by
+// delegating: out, _, err := n.RunWithMetadata(ctx, in); return out, err).
+type MetadataAware interface {
+	NodeKind
+	RunWithMetadata(ctx context.Context, in map[string]string) (map[string]string, map[string]string, error)
+}
+
 // NodeFactory constructs a NodeKind from the raw JSON Config blob
 // attached to a Node IR entry, given the engine's dependency context.
 type NodeFactory func(cfg json.RawMessage, deps Deps) (NodeKind, error)

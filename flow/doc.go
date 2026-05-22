@@ -19,4 +19,11 @@
 // adapter wraps any github.com/costa92/llm-agent/agents.Tool as a
 // one-input / one-output node, so an entire flow can be assembled
 // from already-existing Tools without writing a single Node type.
+//
+// MetadataAware (in node.go) is an additive optional sibling capability:
+// a NodeKind that also implements RunWithMetadata can publish key/value
+// metadata (HTTP status, exec exit code, token usage, etc.) alongside
+// its outputs. The Engine detects the capability via type assertion, so
+// existing NodeKind implementations remain unchanged. NodeFinished
+// events carry the metadata in FlowEvent.Metadata when present.
 package flow

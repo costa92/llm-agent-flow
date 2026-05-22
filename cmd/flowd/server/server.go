@@ -781,6 +781,14 @@ func streamPayload(ev flow.FlowEvent) map[string]any {
 	if ev.Err != nil {
 		m["error"] = ev.Err.Error()
 	}
+	// Metadata is emitted only when populated, mirroring the other
+	// optional fields above. v0.1.0-v0.1.2 SSE consumers see no
+	// "metadata" key on events that don't carry any — fully
+	// back-compatible. D2: key name aligns with otelflow's
+	// span-attribute convention.
+	if len(ev.Metadata) > 0 {
+		m["metadata"] = ev.Metadata
+	}
 	return m
 }
 

@@ -8,6 +8,9 @@ package flow
 //	Kind = FlowStarted:  FlowID != ""
 //	Kind = NodeStarted:  NodeID != "" ; Input != nil (post-decode)
 //	Kind = NodeFinished: NodeID != "" ; Output != nil ; Err is non-nil only on failure
+//	                     Metadata is populated when the node implements
+//	                     MetadataAware (HTTP status, exec exit code,
+//	                     token usage, etc.); nil otherwise.
 //	Kind = NodeSkipped:  NodeID != ""   (no incoming edge fired)
 //	Kind = FlowDone:     Outputs != nil
 //	Kind = FlowErr:      Err != nil
@@ -31,4 +34,13 @@ type FlowEvent struct {
 	Output  map[string]string // current node's output port -> value
 	Outputs map[string]string // terminal: declared flow outputs keyed by Name
 	Err     error
+
+	// Metadata carries optional side-channel key/value pairs about a
+	// node's execution — e.g. HTTP status code, exec exit code, LLM
+	// token usage. Populated only on NodeFinished events emitted by
+	// nodes that implement MetadataAware (see node.go). Nil for nodes
+	// that don't, and on every other Kind. Both success and error
+	// paths preserve Metadata so failed runs still surface debugging
+	// signals (e.g. HTTP 500 with a status code attached).
+	Metadata map[string]string
 }

@@ -82,10 +82,14 @@ type FlowEvent struct
 	field FlowID string
 	field Input map[string]string
 	field Kind FlowEventKind
+	field Metadata map[string]string
 	field NodeID string
 	field Output map[string]string
 	field Outputs map[string]string
 type FlowEventKind uint8
+type MetadataAware interface
+	embed NodeKind
+	method RunWithMetadata(ctx context.Context, in map[string]string) (map[string]string, map[string]string, error)
 type NamedPortRef struct
 	field Name string
 	field PortRef

@@ -5,6 +5,67 @@ All notable changes to `github.com/costa92/llm-agent-flow` are documented here.
 <!-- Keep a Changelog: https://keepachangelog.com/en/1.1.0/ -->
 <!-- Semver: https://semver.org/ — additive-only stability from v0.1.0. -->
 
+## [v0.1.3] - 2026-05-22
+
+Phase — P1-18: `FlowEvent.Metadata` + `MetadataAware` optional
+capability (umbrella roadmap O4).
+
+### Added (additive only — v0.1 promise honored)
+
+- **`FlowEvent.Metadata map[string]string`** — new optional field on
+  `flow.FlowEvent`. Populated on `NodeFinished` events emitted by
+  nodes that implement the new `MetadataAware` capability; `nil` on
+  every other event. Intended for per-node side-channel signals such
+  as HTTP status, exec exit code, or LLM token usage. Error-path
+  metadata is preserved so failed runs still surface debugging
+  signal (e.g. `http_status=500`).
+- **`flow.MetadataAware` interface** — optional sibling to
+  `NodeKind`. Implementations add a single
+  `RunWithMetadata(ctx, in) (out, metadata, err)` method; the engine
+  detects the capability via type assertion on every invocation.
+  Existing `NodeKind` implementations remain unchanged and continue
+  to run unmodified. `MetadataAware` will remain optional through
+  the v0.1.x band — it will not be promoted into the required
+  `NodeKind` shape before v0.2.
+
+### Changed (internal — no API removal)
+
+- **Engine `RunStream` / `Run`** now type-asserts each node against
+  `MetadataAware` before invoking `NodeKind.Run`. Metadata returned
+  by capable nodes is cloned (mirroring the existing `Output` clone)
+  and placed on the emitted `NodeFinished` event.
+- **`cmd/flowd` SSE / replay payload** gains a `"metadata"` key on
+  events whose `FlowEvent.Metadata` is non-empty. The key is
+  omitted entirely for nil and empty maps, so existing SSE / replay
+  consumers see byte-identical payloads for legacy flows.
+
+### Tests
+
+- `flow/event_metadata_test.go` (1 case) — `FlowEvent.Metadata`
+  field shape.
+- `flow/engine_metadata_test.go` (3 cases) — engine propagates
+  metadata for `MetadataAware` nodes; leaves `Metadata=nil` for
+  plain `NodeKind` nodes; preserves metadata on the error path.
+- `cmd/flowd/server/server_metadata_test.go` (4 cases) —
+  `streamPayload` includes metadata when populated, omits it on
+  nil and empty maps, and the run-history replay round-trips the
+  metadata JSON through SQLite persistence.
+
+### Snapshot baseline
+
+`api/v0.1.snapshot.txt` regenerated for the additive shape
+(`field Metadata map[string]string` on `FlowEvent` +
+`type MetadataAware interface`).
+
+### Follow-ups (deferred — scope kept tight)
+
+- A sample `MetadataAware` implementation on the bundled `toolNode`
+  (e.g. surfacing HTTP status / exec exit code) is deferred to its
+  own PR (D3) so this PR stays additive-only and stdlib-only.
+- The umbrella `docs/source-design-llm-agent-flow.zh-CN.md`
+  status-table update for O4 lives in the umbrella repo and is
+  deferred to a follow-up cross-repo PR (D5).
+
 ## [v0.1.2] - 2026-05-22
 
 Phase — P1-17: SQLite write-throughput hardening (umbrella roadmap).
