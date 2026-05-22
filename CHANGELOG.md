@@ -5,6 +5,50 @@ All notable changes to `github.com/costa92/llm-agent-flow` are documented here.
 <!-- Keep a Changelog: https://keepachangelog.com/en/1.1.0/ -->
 <!-- Semver: https://semver.org/ — additive-only stability from v0.1.0. -->
 
+## [v0.1.2] - 2026-05-22
+
+Phase — P1-17: SQLite write-throughput hardening (umbrella roadmap).
+
+### Changed (internal — no API change)
+
+- **`(*sqlite.Store)` now enables `PRAGMA journal_mode=WAL` and
+  `synchronous=NORMAL` on every on-disk DSN** (`:memory:` and
+  `mode=memory` URI variants are detected and left at defaults).
+  WAL gives concurrent readers, NORMAL trades a tiny crash-window
+  for a large fsync reduction. PRAGMA failures during `Open` are
+  surfaced as errors so misconfigured environments fail fast.
+
+### Operational note
+
+On-disk SQLite databases now produce two sidecar files:
+
+- `<db>-wal` — the write-ahead log
+- `<db>-shm` — shared-memory index
+
+Both must be included in backup / snapshot / volume-mount strategies
+or the database can be left in an inconsistent state. `cmd/flowd`
+logs a one-line reminder on startup when a non-memory DSN is used.
+
+### Performance (measured 2026-05-22, 5 iter × 3 count, median)
+
+| Workload                         | Before WAL (v0.1.1) | After WAL (v0.1.2) | Speedup |
+|----------------------------------|---------------------|--------------------|---------|
+| `AppendRunEvents` batch-of-600   | ~26 ms/op           | ~1.5 ms/op         | **~17×** |
+| `AppendRunEvent` × 600 single    | ~14,800 ms/op       | ~42 ms/op          | **~350×** |
+
+The umbrella roadmap P1-17 target was 5–16×; WAL alone exceeds
+it. A subsequent multi-VALUES `INSERT` change was scoped and
+deferred — see PR description for the YAGNI rationale.
+
+### Tests
+
+- `flow/store/sqlite/wal_test.go` (3 cases) — on-disk enables WAL +
+  NORMAL; `:memory:` does not; PRAGMA failure surfaces as `Open`
+  error.
+- `flow/store/sqlite/events_batch_test.go` (+2 cases) — large-batch
+  one-statement contract baseline, chunk-boundary correctness.
+- `flow/store/sqlite/events_bench_test.go` — benchmarks above.
+
 ## [v0.1.1] - 2026-05-21
 
 Phase 11 — Performance: engine cache LRU + sync-run event batching.
