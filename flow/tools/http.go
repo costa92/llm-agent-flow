@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -69,39 +70,66 @@ type httpTool struct {
 func (t *httpTool) Name() string { return t.name }
 
 func (t *httpTool) Execute(ctx context.Context, args json.RawMessage) (string, error) {
+	out, _, err := t.ExecuteWithMetadata(ctx, args)
+	return out, err
+}
+
+// ExecuteWithMetadata satisfies flow.MetadataAwareTool. It emits:
+//   - http_status: numeric HTTP status code as decimal string
+//   - bytes:       size of the response body (capped read)
+//   - duration_ms: wall-clock duration of the request in ms
+//
+// D1: on non-2xx the same three keys are still set so traces /
+// dashboards retain signal on failed runs.
+func (t *httpTool) ExecuteWithMetadata(ctx context.Context, args json.RawMessage) (string, map[string]string, error) {
 	body := args
 	if len(body) == 0 {
 		body = []byte("{}")
 	}
 	req, err := http.NewRequestWithContext(ctx, t.cfg.Method, t.cfg.URL, bytes.NewReader(body))
 	if err != nil {
-		return "", fmt.Errorf("http tool %q: build request: %w", t.name, err)
+		return "", nil, fmt.Errorf("http tool %q: build request: %w", t.name, err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	for k, v := range t.cfg.Headers {
 		req.Header.Set(k, v)
 	}
+	start := time.Now()
 	resp, err := t.client.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("http tool %q: do: %w", t.name, err)
+		// No status / bytes available — only duration. Keep meta
+		// non-nil to honor D1 (something better than nothing).
+		meta := map[string]string{
+			"duration_ms": strconv.FormatInt(time.Since(start).Milliseconds(), 10),
+		}
+		return "", meta, fmt.Errorf("http tool %q: do: %w", t.name, err)
 	}
 	defer resp.Body.Close()
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if err != nil {
-		return "", fmt.Errorf("http tool %q: read body: %w", t.name, err)
+	raw, readErr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	durationMs := strconv.FormatInt(time.Since(start).Milliseconds(), 10)
+	meta := map[string]string{
+		"http_status": strconv.Itoa(resp.StatusCode),
+		"bytes":       strconv.Itoa(len(raw)),
+		"duration_ms": durationMs,
+	}
+	if readErr != nil {
+		return "", meta, fmt.Errorf("http tool %q: read body: %w", t.name, readErr)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return "", fmt.Errorf("http tool %q: status %d: %s", t.name, resp.StatusCode, trimBody(raw))
+		return "", meta, fmt.Errorf("http tool %q: status %d: %s", t.name, resp.StatusCode, trimBody(raw))
 	}
 	// Try {"output":"..."} shape.
 	var shaped struct {
 		Output string `json:"output"`
 	}
 	if json.Unmarshal(raw, &shaped) == nil && shaped.Output != "" {
-		return shaped.Output, nil
+		return shaped.Output, meta, nil
 	}
-	return string(raw), nil
+	return string(raw), meta, nil
 }
+
+// Compile-time pin: httpTool implements MetadataAwareTool (D3).
+var _ flow.MetadataAwareTool = (*httpTool)(nil)
 
 func trimBody(b []byte) string {
 	const max = 256
