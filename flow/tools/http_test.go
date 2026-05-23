@@ -6,9 +6,11 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 
+	"github.com/costa92/llm-agent-flow/flow"
 	"github.com/costa92/llm-agent-flow/flow/tools"
 )
 
@@ -81,6 +83,75 @@ func TestHTTPToolNon2xxReturnsError(t *testing.T) {
 	_, err := tool.Execute(context.Background(), []byte(`{}`))
 	if err == nil || !strings.Contains(err.Error(), "status 500") || !strings.Contains(err.Error(), "boom") {
 		t.Fatalf("Execute = %v, want 500/boom error", err)
+	}
+}
+
+// TestHTTPTool_EmitsStatusMetadata_On2xx pins D3 for the http kind:
+// a successful call surfaces http_status, bytes, and duration_ms via
+// the optional MetadataAwareTool capability.
+func TestHTTPTool_EmitsStatusMetadata_On2xx(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"output":"OK"}`)
+	}))
+	defer srv.Close()
+	tool, _ := httpToolFromManifest(t, srv.URL)
+	mat, ok := tool.(flow.MetadataAwareTool)
+	if !ok {
+		t.Fatalf("httpTool does not implement MetadataAwareTool")
+	}
+	out, meta, err := mat.ExecuteWithMetadata(context.Background(), []byte(`{"input":"x"}`))
+	if err != nil {
+		t.Fatalf("ExecuteWithMetadata: %v", err)
+	}
+	if out == "" {
+		t.Fatalf("output empty; want decoded body")
+	}
+	if meta == nil {
+		t.Fatalf("meta = nil, want populated")
+	}
+	if meta["http_status"] != "200" {
+		t.Fatalf("meta[http_status] = %q, want 200", meta["http_status"])
+	}
+	if meta["bytes"] == "" {
+		t.Fatalf("meta[bytes] = empty, want non-empty count")
+	}
+	if _, perr := strconv.Atoi(meta["bytes"]); perr != nil {
+		t.Fatalf("meta[bytes] = %q, want integer string", meta["bytes"])
+	}
+	if meta["duration_ms"] == "" {
+		t.Fatalf("meta[duration_ms] = empty, want numeric string")
+	}
+}
+
+// TestHTTPTool_EmitsMetadataOnNon2xx pins D1 on the http kind:
+// metadata MUST be non-nil even on the error path so trace consumers
+// still see http_status=500 + bytes.
+func TestHTTPTool_EmitsMetadataOnNon2xx(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = io.WriteString(w, "upstream went bang")
+	}))
+	defer srv.Close()
+	tool, _ := httpToolFromManifest(t, srv.URL)
+	mat, ok := tool.(flow.MetadataAwareTool)
+	if !ok {
+		t.Fatalf("httpTool does not implement MetadataAwareTool")
+	}
+	out, meta, err := mat.ExecuteWithMetadata(context.Background(), []byte(`{}`))
+	if err == nil {
+		t.Fatalf("err = nil on 500; want error")
+	}
+	if out != "" {
+		t.Fatalf("out = %q, want empty on error", out)
+	}
+	if meta == nil {
+		t.Fatalf("meta = nil on error; D1 requires non-nil metadata on error path")
+	}
+	if meta["http_status"] != "500" {
+		t.Fatalf("meta[http_status] = %q, want 500", meta["http_status"])
+	}
+	if meta["bytes"] == "" {
+		t.Fatalf("meta[bytes] = empty, want byte count even on error")
 	}
 }
 
