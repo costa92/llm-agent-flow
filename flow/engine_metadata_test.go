@@ -115,6 +115,54 @@ func TestEngineEmitsNilMetadataForPlainNode(t *testing.T) {
 	}
 }
 
+// TestEngineSurfacesToolMetadataThroughToolNode wires up the real
+// "tool" node type registered via RegisterToolNode against a tool that
+// implements MetadataAwareTool. The engine MUST surface the tool's
+// metadata onto NodeFinished.Metadata — this pins D3: the production
+// toolNode is now a MetadataAware participant, not just the test
+// fixtures (metaNode / metaServerNode).
+func TestEngineSurfacesToolMetadataThroughToolNode(t *testing.T) {
+	reg := NewNodeRegistry()
+	if err := RegisterToolNode(reg); err != nil {
+		t.Fatalf("RegisterToolNode: %v", err)
+	}
+	tool := &metaFakeTool{
+		name: "demo",
+		out:  "echo: hi",
+		meta: map[string]string{"http_status": "200", "duration_ms": "5"},
+	}
+	deps := Deps{Tools: ToolMap{tool.Name(): tool}}
+	flowJSON := `{
+	  "id": "tool_flow",
+	  "nodes": [
+	    { "id": "n", "type": "tool", "config": {"tool": "demo"} }
+	  ],
+	  "edges": [],
+	  "inputs":  [{ "name": "input",  "node": "n", "port": "input"  }],
+	  "outputs": [{ "name": "output", "node": "n", "port": "output" }]
+	}`
+	eng, err := LoadCompile(strings.NewReader(flowJSON), reg, deps)
+	if err != nil {
+		t.Fatalf("LoadCompile: %v", err)
+	}
+	ch, err := eng.RunStream(context.Background(), map[string]string{"input": "hi"})
+	if err != nil {
+		t.Fatalf("RunStream: %v", err)
+	}
+	var got map[string]string
+	for ev := range ch {
+		if ev.Kind == NodeFinished && ev.NodeID == "n" {
+			got = ev.Metadata
+		}
+	}
+	if got == nil {
+		t.Fatalf("NodeFinished.Metadata = nil, want populated map (D3 pin: toolNode surfaces tool metadata)")
+	}
+	if got["http_status"] != "200" || got["duration_ms"] != "5" {
+		t.Fatalf("NodeFinished.Metadata = %v, want http_status=200 + duration_ms=5", got)
+	}
+}
+
 // TestEngineKeepsMetadataOnErrorPath nails decision D1: when a
 // MetadataAware node fails, the NodeFinished event still carries the
 // metadata it managed to publish so traces / dashboards retain useful
