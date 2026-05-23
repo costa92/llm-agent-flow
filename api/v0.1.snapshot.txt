@@ -90,6 +90,9 @@ type FlowEventKind uint8
 type MetadataAware interface
 	embed NodeKind
 	method RunWithMetadata(ctx context.Context, in map[string]string) (map[string]string, map[string]string, error)
+type MetadataAwareTool interface
+	embed Tool
+	method ExecuteWithMetadata(ctx context.Context, args json.RawMessage) (string, map[string]string, error)
 type NamedPortRef struct
 	field Name string
 	field PortRef

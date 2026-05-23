@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os/exec"
+	"strconv"
 	"strings"
 	"time"
 
@@ -55,6 +56,20 @@ type execTool struct {
 func (t *execTool) Name() string { return t.name }
 
 func (t *execTool) Execute(ctx context.Context, args json.RawMessage) (string, error) {
+	out, _, err := t.ExecuteWithMetadata(ctx, args)
+	return out, err
+}
+
+// ExecuteWithMetadata satisfies flow.MetadataAwareTool. It emits:
+//   - exit_code:   numeric exit status (decimal string) on clean exits.
+//   - duration_ms: wall-clock command duration in ms.
+//   - signal:      "timeout" on context-deadline cancellation (no
+//     exit_code in that case — ProcessState may be nil or unexited).
+//
+// D1: on non-zero exit and on timeout the metadata map is non-nil so
+// downstream traces / dashboards still see the failure signal
+// alongside the wrapped error.
+func (t *execTool) ExecuteWithMetadata(ctx context.Context, args json.RawMessage) (string, map[string]string, error) {
 	body := args
 	if len(body) == 0 {
 		body = []byte("{}")
@@ -69,14 +84,43 @@ func (t *execTool) Execute(ctx context.Context, args json.RawMessage) (string, e
 	cmd.Stdout = &limitWriter{w: &stdout, max: 1 << 20}
 	cmd.Stderr = &limitWriter{w: &stderr, max: 1 << 14}
 
-	if err := cmd.Run(); err != nil {
+	start := time.Now()
+	runErr := cmd.Run()
+	durationMs := strconv.FormatInt(time.Since(start).Milliseconds(), 10)
+
+	if runErr != nil {
+		// Timeout / context-cancel path: ProcessState may be nil if the
+		// child was killed before it could report exit, so guard the
+		// deref. signal=timeout disambiguates from a normal non-zero
+		// exit for trace consumers.
 		if errors.Is(callCtx.Err(), context.DeadlineExceeded) {
-			return "", fmt.Errorf("exec tool %q: timeout after %d ms", t.name, t.cfg.TimeoutMs)
+			return "", map[string]string{
+				"signal":      "timeout",
+				"duration_ms": durationMs,
+			}, fmt.Errorf("exec tool %q: timeout after %d ms", t.name, t.cfg.TimeoutMs)
 		}
-		return "", fmt.Errorf("exec tool %q: %w (stderr: %s)", t.name, err, trimBody(stderr.Bytes()))
+		// Non-zero exit (clean child, bad return). Preserve exit_code.
+		meta := map[string]string{"duration_ms": durationMs}
+		if cmd.ProcessState != nil {
+			meta["exit_code"] = strconv.Itoa(cmd.ProcessState.ExitCode())
+		}
+		return "", meta, fmt.Errorf("exec tool %q: %w (stderr: %s)", t.name, runErr, trimBody(stderr.Bytes()))
 	}
-	return strings.TrimRight(stdout.String(), "\r\n"), nil
+	meta := map[string]string{
+		"exit_code":   "0",
+		"duration_ms": durationMs,
+	}
+	if cmd.ProcessState != nil {
+		// Defensive: prefer the real ExitCode if available (always 0
+		// here on the success branch, but the explicit form keeps the
+		// meta map self-consistent for callers).
+		meta["exit_code"] = strconv.Itoa(cmd.ProcessState.ExitCode())
+	}
+	return strings.TrimRight(stdout.String(), "\r\n"), meta, nil
 }
+
+// Compile-time pin: execTool implements MetadataAwareTool (D3).
+var _ flow.MetadataAwareTool = (*execTool)(nil)
 
 // limitWriter caps the bytes copied into the wrapped buffer. Excess
 // writes succeed silently — caller sees a truncated buffer but no

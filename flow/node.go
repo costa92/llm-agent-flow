@@ -72,6 +72,26 @@ type Tool interface {
 	Execute(ctx context.Context, args json.RawMessage) (string, error)
 }
 
+// MetadataAwareTool is an OPTIONAL capability sibling to Tool. Tools
+// implementing it can publish key/value metadata alongside their
+// string output — e.g. HTTP response status, exec exit code,
+// response body size, request duration, token usage.
+//
+// toolNode type-asserts this at run time. Tools that do not implement
+// it run via the plain Tool.Execute path and produce nil metadata
+// (matching pre-v0.2 behavior).
+//
+// MetadataAwareTool will remain optional throughout v0.1.x; it will
+// NOT be promoted to a required Tool method before v0.2.
+//
+// Implementations MUST also implement Tool.Execute (typically by
+// delegating: out, _, err := t.ExecuteWithMetadata(ctx, args);
+// return out, err). Metadata is preserved on the error path (D1).
+type MetadataAwareTool interface {
+	Tool
+	ExecuteWithMetadata(ctx context.Context, args json.RawMessage) (string, map[string]string, error)
+}
+
 // NodeRegistry is the central mapping of node-type strings to factories.
 // Concurrency-safe.
 type NodeRegistry struct {

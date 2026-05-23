@@ -26,4 +26,13 @@
 // its outputs. The Engine detects the capability via type assertion, so
 // existing NodeKind implementations remain unchanged. NodeFinished
 // events carry the metadata in FlowEvent.Metadata when present.
+//
+// MetadataAwareTool (also in node.go) is the equivalent capability at
+// the Tool layer. Tools implementing ExecuteWithMetadata surface
+// per-call metadata up through the bundled toolNode, which itself
+// implements MetadataAware. The built-in http and exec tools (under
+// flow/tools) implement MetadataAwareTool — http_status / bytes /
+// duration_ms for http calls, exit_code / duration_ms / signal for
+// exec invocations. Plain flow.Tool implementations continue to work
+// unchanged and produce nil metadata.
 package flow

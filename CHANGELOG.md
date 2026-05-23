@@ -5,6 +5,52 @@ All notable changes to `github.com/costa92/llm-agent-flow` are documented here.
 <!-- Keep a Changelog: https://keepachangelog.com/en/1.1.0/ -->
 <!-- Semver: https://semver.org/ — additive-only stability from v0.1.0. -->
 
+## [v0.1.4] - 2026-05-23
+
+Phase — D3 (closes the P1-18 deferred work): production `toolNode`
+now surfaces tool-side metadata.
+
+### Added (additive only — v0.1 promise honored)
+
+- **`flow.MetadataAwareTool`** — OPTIONAL sibling capability to
+  `flow.Tool`. Tools implementing it can publish key/value metadata
+  (HTTP status, exec exit code, response size, request duration,
+  token usage) alongside the string output. `toolNode` type-asserts
+  this at run time; plain `flow.Tool` implementations continue to
+  run unchanged and produce nil metadata.
+- **`toolNode` now implements `MetadataAware`.** Its `RunWithMetadata`
+  forwards metadata from any `MetadataAwareTool` it wraps onto the
+  engine's `FlowEvent.Metadata` channel — including on the error
+  path (D1 contract: metadata preserved on failure).
+- **Built-in tools implement `MetadataAwareTool`:**
+  - `http` kind emits `http_status`, `bytes`, `duration_ms` —
+    including on the 5xx error path.
+  - `exec` kind emits `exit_code`, `duration_ms` on clean exits;
+    `signal: "timeout"` + `duration_ms` on context-deadline
+    cancellation.
+
+### Tests
+
+- `flow/tool_node_test.go` (3 cases) — toolNode propagates metadata
+  from aware tools, returns nil for plain tools, preserves metadata
+  on the error path.
+- `flow/engine_metadata_test.go` (+1 case) — engine surfaces tool
+  metadata end-to-end through the production "tool" node type.
+- `flow/tools/http_test.go` (+2 cases) — httpTool emits status /
+  bytes / duration metadata on 2xx and on 5xx (D1).
+- `flow/tools/exec_test.go` (+3 cases) — execTool emits exit_code on
+  success and failure; signal=timeout on deadline.
+- `cmd/flowd/server/server_metadata_test.go` (+1 case) — replay
+  round-trips http_status through engine → store → replay using the
+  production `toolNode` + `httpTool` combination.
+
+### Notes
+
+- No upstream changes — `agents.Tool` (in `llm-agent`) is untouched.
+  `flow.Tool` stays flow-local, as documented at `flow/node.go:66-69`.
+- `agentToolAdapter` (in `flow/adapter_llmagent.go`) intentionally
+  remains metadata-blind. Out of scope for v0.1.x.
+
 ## [v0.1.3] - 2026-05-22
 
 Phase — P1-18: `FlowEvent.Metadata` + `MetadataAware` optional
