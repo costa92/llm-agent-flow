@@ -1,5 +1,6 @@
 # .github/workflows/release-precheck.yml
 # INFRA-04: rejects `replace` directives on tagged-release branches.
+# Lifted from PITFALLS.md Pitfall 12 §"How to avoid". Identical across all 4 repos.
 name: release-precheck
 
 on:
