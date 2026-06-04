@@ -1,3 +1,5 @@
+[English](./architecture.md) | [简体中文](./architecture.zh-CN.md)
+
 # Architecture — `llm-agent-flow`
 
 This document describes how the pieces of `llm-agent-flow` fit

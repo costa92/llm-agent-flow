@@ -1,3 +1,5 @@
+[English](./compatibility.md) | [简体中文](./compatibility.zh-CN.md)
+
 # Compatibility promise — `llm-agent-flow` v0.1.x
 
 Effective from **v0.1.0** (tagged 2026-05-21).
