@@ -1,3 +1,5 @@
+[English](./operations.md) | [简体中文](./operations.zh-CN.md)
+
 # Operations — deploying `cmd/flowd`
 
 How to run `flowd` in production. For first-time use see
