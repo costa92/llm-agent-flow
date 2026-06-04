@@ -7,13 +7,13 @@
 
 ## 文档
 
-- **[教程](docs/tutorial.md)** —— 你的第一个流程、自定义工具、
+- **[教程](docs/tutorial.zh-CN.md)** —— 你的第一个流程、自定义工具、
   条件路由、`cmd/flowd` REST API。
-- **[架构](docs/architecture.md)** —— Engine / Store /
+- **[架构](docs/architecture.zh-CN.md)** —— Engine / Store /
   otelflow / flowd 如何组合；Runner 接口；执行模型。
-- **[运维](docs/operations.md)** —— 部署 `flowd`：鉴权、
+- **[运维](docs/operations.zh-CN.md)** —— 部署 `flowd`：鉴权、
   SQLite、OTel、性能、备份、升级路径。
-- **[兼容性承诺](docs/compatibility.md)** —— v0.1
+- **[兼容性承诺](docs/compatibility.zh-CN.md)** —— v0.1
   冻结覆盖了哪些内容；快照门禁如何工作。
 
 流程是由类型化的边连接的节点构成的有向无环图，

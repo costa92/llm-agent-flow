@@ -3,8 +3,8 @@
 # 运维 —— 部署 `cmd/flowd`
 
 如何在生产中运行 `flowd`。关于首次使用参见
-[`tutorial.md`](tutorial.md)；关于 v0.1.x 冻结覆盖什么参见
-[`compatibility.md`](compatibility.md)。
+[`tutorial.md`](tutorial.zh-CN.md)；关于 v0.1.x 冻结覆盖什么参见
+[`compatibility.md`](compatibility.zh-CN.md)。
 
 ## 标志 + 环境变量
 
@@ -219,7 +219,7 @@ sqlite3 flow.db "
 变更、无 DB 迁移、无需客户端重新编译。
 
 `v0.2.0`（发布时）**将** 被允许破坏 IR / API 形状；清晰的迁移说明
-会出现在 [CHANGELOG](../CHANGELOG.md) 中，并且 `/v2` module 路径
+会出现在 [CHANGELOG](../CHANGELOG.zh-CN.md) 中，并且 `/v2` module 路径
 会为破坏性部分替代 `/v0.1`。
 
 ## v0.1 的非目标

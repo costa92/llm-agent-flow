@@ -5,8 +5,8 @@
 从“运行演示”到“用 HTTP 支撑的工具和条件分支部署一个自定义流程”，
 带你走一遍 `llm-agent-flow`。
 
-关于线级细节参见 [`architecture.md`](architecture.md)；关于生产
-部署参见 [`operations.md`](operations.md)。
+关于线级细节参见 [`architecture.md`](architecture.zh-CN.md)；关于生产
+部署参见 [`operations.md`](operations.zh-CN.md)。
 
 ## 1. 安装 + 运行随附的演示
 
@@ -229,7 +229,7 @@ curl -X POST http://localhost:7861/runs/4351cce92d54ba5d/replay
 ```
 
 关于鉴权、OTel 追踪、扩展考量 —— 参见
-[`operations.md`](operations.md)。
+[`operations.md`](operations.zh-CN.md)。
 
 ## 6. 库用法 —— 在你自己的 Go 服务中嵌入 `llm-agent-flow`
 
@@ -273,10 +273,10 @@ for ev := range ch {
 
 对于 OTel 追踪的流程，用 `llm-agent-otel` 兄弟仓的
 `otelflow.Wrap` 包装 —— 参见
-[`architecture.md`](architecture.md#telemetry--otelflow-sister-repo)。
+[`architecture.md`](architecture.zh-CN.md)。
 
 ## 7. 后续步骤
 
-- [`compatibility.md`](compatibility.md) —— v0.1.x 冻结覆盖什么。
-- [`architecture.md`](architecture.md) —— 内部设计。
-- [`operations.md`](operations.md) —— 在生产中部署 `flowd`。
+- [`compatibility.md`](compatibility.zh-CN.md) —— v0.1.x 冻结覆盖什么。
+- [`architecture.md`](architecture.zh-CN.md) —— 内部设计。
+- [`operations.md`](operations.zh-CN.md) —— 在生产中部署 `flowd`。

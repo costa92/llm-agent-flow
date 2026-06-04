@@ -3,9 +3,9 @@
 # 架构 —— `llm-agent-flow`
 
 本文档描述 `llm-agent-flow` 的各部分如何组合在一起。关于稳定性契约
-参见 [`compatibility.md`](compatibility.md)；关于首次使用参见
-[`tutorial.md`](tutorial.md)；关于生产部署参见
-[`operations.md`](operations.md)。
+参见 [`compatibility.md`](compatibility.zh-CN.md)；关于首次使用参见
+[`tutorial.md`](tutorial.zh-CN.md)；关于生产部署参见
+[`operations.md`](operations.zh-CN.md)。
 
 ## 一览
 
@@ -214,7 +214,7 @@ ctx 正常传播，无意外。
 
 该门禁使 v0.1 承诺 **可执行** —— 一次丢掉方法、重命名参数或重新
 签名接口的重构会在评审前让 CI 失败。关于规则与重新生成流程参见
-[compatibility.md](compatibility.md)。
+[compatibility.md](compatibility.zh-CN.md)。
 
 ## 各部分位置
 
