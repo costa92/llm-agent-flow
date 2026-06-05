@@ -3,7 +3,6 @@ package sqlite
 import (
 	"context"
 	"database/sql"
-	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -31,7 +30,15 @@ type Store struct {
 // The schema is created if the database is empty (idempotent), so
 // callers do NOT need to run migrations separately.
 func Open(dsn string) (*Store, error) {
-	db, err := sql.Open("sqlite", dsn)
+	// busy_timeout is a PER-CONNECTION pragma: setting it via ExecContext in
+	// configurePragmas only covers the connection that happens to run it, so
+	// new pooled connections would still fail with SQLITE_BUSY under
+	// concurrent writes. For on-disk DSNs we therefore also inject it into
+	// the driver DSN (modernc honors _pragma=busy_timeout on every connection
+	// open). configurePragmas keeps the explicit PRAGMA too, for callers that
+	// pass a pre-built DSN of their own.
+	openDSN := withBusyTimeoutPragma(dsn)
+	db, err := sql.Open("sqlite", openDSN)
 	if err != nil {
 		return nil, fmt.Errorf("flow/store/sqlite: open: %w", err)
 	}
@@ -61,7 +68,29 @@ func (s *Store) configurePragmas(ctx context.Context, dsn string) error {
 	if _, err := s.db.ExecContext(ctx, `PRAGMA synchronous=NORMAL`); err != nil {
 		return fmt.Errorf("flow/store/sqlite: set synchronous=NORMAL: %w", err)
 	}
+	if _, err := s.db.ExecContext(ctx, `PRAGMA busy_timeout=5000`); err != nil {
+		return fmt.Errorf("flow/store/sqlite: set busy_timeout: %w", err)
+	}
 	return nil
+}
+
+// withBusyTimeoutPragma appends modernc's _pragma=busy_timeout(5000) query
+// param to an on-disk DSN so EVERY pooled connection (not just the one that
+// runs configurePragmas) waits up to 5s on a held write lock instead of
+// failing with SQLITE_BUSY. In-memory DSNs are left untouched. If the DSN
+// already requests a busy_timeout pragma it is left as-is.
+func withBusyTimeoutPragma(dsn string) string {
+	if isMemoryDSN(dsn) {
+		return dsn
+	}
+	if strings.Contains(strings.ToLower(dsn), "busy_timeout") {
+		return dsn
+	}
+	sep := "?"
+	if strings.Contains(dsn, "?") {
+		sep = "&"
+	}
+	return dsn + sep + "_pragma=busy_timeout(5000)"
 }
 
 func isMemoryDSN(dsn string) bool {
@@ -147,13 +176,6 @@ func (s *Store) Close() error {
 func nowUnix() int64 { return time.Now().UnixMicro() }
 
 func unixToTime(us int64) time.Time { return time.UnixMicro(us).UTC() }
-
-// errIs unwraps the modernc-driver constraint error into our public
-// sentinels. The driver does not export typed errors so we string-match
-// for PRIMARY-KEY violations.
-func errIs(err error, hint string) bool {
-	return err != nil && (errors.Is(err, sql.ErrNoRows) || (hint != "" && containsCI(err.Error(), hint)))
-}
 
 // containsCI is case-insensitive substring search using stdlib only.
 func containsCI(haystack, needle string) bool {

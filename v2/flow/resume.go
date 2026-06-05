@@ -31,7 +31,11 @@ func (e *Engine) Resume(ctx context.Context, runID, token string, humanInput map
 		if errors.Is(err, ErrCheckpointNotFound) {
 			return RunResult{}, err
 		}
-		return RunResult{}, fmt.Errorf("%w: %v", ErrCheckpointNotFound, err)
+		// A genuine store/IO failure is NOT a not-found — wrap with context
+		// but do NOT mislabel it under ErrCheckpointNotFound, or callers'
+		// errors.Is(err, ErrCheckpointNotFound) would treat a transient
+		// failure as a permanent missing checkpoint.
+		return RunResult{}, fmt.Errorf("flow: resume: load checkpoint: %w", err)
 	}
 	if cp.FlowHash != e.flowHash {
 		return RunResult{}, ErrFlowChanged

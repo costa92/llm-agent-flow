@@ -621,3 +621,101 @@ func TestFreshRun_Unchanged(t *testing.T) {
 		t.Fatalf("c should be omitted (skipped branch), got %v", out["c"])
 	}
 }
+
+// TestMemoryCheckpointStore_LoadReturnsCopy — a Checkpoint loaded from the
+// store must be an independent deep copy: mutating the loaded Activated /
+// PortValues / EdgeStates must NOT corrupt the store's retained copy.
+func TestMemoryCheckpointStore_LoadReturnsCopy(t *testing.T) {
+	ctx := context.Background()
+	cs := NewMemoryCheckpointStore()
+	orig := Checkpoint{
+		RunID:      "r1",
+		FlowID:     "f1",
+		Activated:  map[string]bool{"n1": true},
+		PortValues: map[string]map[string]json.RawMessage{"n1": {"out": json.RawMessage(`"v"`)}},
+		EdgeStates: []EdgeFireState{EdgeFired, EdgePending},
+		OriginalInputs: map[string]json.RawMessage{"in": json.RawMessage(`"x"`)},
+	}
+	if err := cs.SaveCheckpoint(ctx, orig); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	loaded, err := cs.LoadCheckpoint(ctx, "r1")
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	// Mutate the loaded copy.
+	loaded.Activated["n1"] = false
+	loaded.Activated["n2"] = true
+	loaded.PortValues["n1"]["out"] = json.RawMessage(`"mutated"`)
+	loaded.PortValues["n3"] = map[string]json.RawMessage{"p": json.RawMessage(`"z"`)}
+	loaded.EdgeStates[0] = EdgeDeadFalse
+	loaded.OriginalInputs["in"] = json.RawMessage(`"corrupt"`)
+
+	// Re-load and assert the store copy is unmutated.
+	again, err := cs.LoadCheckpoint(ctx, "r1")
+	if err != nil {
+		t.Fatalf("re-load: %v", err)
+	}
+	if again.Activated["n1"] != true {
+		t.Fatalf("Activated[n1] = %v, want true (store corrupted)", again.Activated["n1"])
+	}
+	if _, ok := again.Activated["n2"]; ok {
+		t.Fatalf("Activated[n2] present, want absent (store corrupted)")
+	}
+	if string(again.PortValues["n1"]["out"]) != `"v"` {
+		t.Fatalf("PortValues[n1][out] = %s, want \"v\" (store corrupted)", again.PortValues["n1"]["out"])
+	}
+	if _, ok := again.PortValues["n3"]; ok {
+		t.Fatalf("PortValues[n3] present, want absent (store corrupted)")
+	}
+	if again.EdgeStates[0] != EdgeFired {
+		t.Fatalf("EdgeStates[0] = %v, want EdgeFired (store corrupted)", again.EdgeStates[0])
+	}
+	if string(again.OriginalInputs["in"]) != `"x"` {
+		t.Fatalf("OriginalInputs[in] = %s, want \"x\" (store corrupted)", again.OriginalInputs["in"])
+	}
+}
+
+// errLoadStore is a CheckpointStore whose LoadCheckpoint returns a custom
+// (non-not-found) error, simulating a genuine store/IO failure.
+type errLoadStore struct{ err error }
+
+func (s errLoadStore) SaveCheckpoint(context.Context, Checkpoint) error { return nil }
+func (s errLoadStore) LoadCheckpoint(context.Context, string) (Checkpoint, error) {
+	return Checkpoint{}, s.err
+}
+func (s errLoadStore) DeleteCheckpoint(context.Context, string) error { return nil }
+func (s errLoadStore) ListCheckpoints(context.Context, string, int) ([]CheckpointMeta, error) {
+	return nil, nil
+}
+
+// TestResume_StoreErrorNotMislabeledNotFound — a genuine store error from
+// LoadCheckpoint must surface as an error that is NOT errors.Is
+// ErrCheckpointNotFound (only the sentinel itself maps to not-found).
+func TestResume_StoreErrorNotMislabeledNotFound(t *testing.T) {
+	reg := registerMixed(map[string]NodeKind{
+		"I": newInterruptNode("in", "out", InterruptRequest{Prompt: "p"}),
+	})
+	f := Flow{
+		ID:      "store-err",
+		Nodes:   []Node{{ID: "I", Type: "I"}},
+		Inputs:  []NamedPortRef{{Name: "x", PortRef: PortRef{"I", "in"}}},
+		Outputs: []NamedPortRef{{Name: "y", PortRef: PortRef{"I", "out"}}},
+	}
+	ioErr := errors.New("disk on fire")
+	eng, err := Compile(f, reg, Deps{}, WithCheckpointStore(errLoadStore{err: ioErr}))
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	_, rerr := eng.Resume(context.Background(), "r1", "r1", nil)
+	if rerr == nil {
+		t.Fatal("Resume returned nil error, want store error")
+	}
+	if errors.Is(rerr, ErrCheckpointNotFound) {
+		t.Fatalf("Resume err %v mislabeled as ErrCheckpointNotFound", rerr)
+	}
+	if !errors.Is(rerr, ioErr) {
+		t.Fatalf("Resume err %v does not wrap the underlying store error", rerr)
+	}
+}

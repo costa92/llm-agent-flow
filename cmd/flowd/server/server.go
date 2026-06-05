@@ -23,20 +23,11 @@ import (
 	"io"
 	"log"
 	"net/http"
-	"sync"
 
 	"github.com/costa92/llm-agent-flow/flow"
 	flowstore "github.com/costa92/llm-agent-flow/flow/store"
 	v2flow "github.com/costa92/llm-agent-flow/v2/flow"
 )
-
-// Ensure stdlib sync stays used (runWithStore still uses sync.Mutex
-// for emit serialization in some call paths). Removing the engine
-// cache's sync.Map dropped one user but emitMu in run handlers
-// still pulls it in transitively via the runtime. This import-
-// pinning comment is a hedge against a future cleanup that removes
-// the last sync usage and leaves the line dangling.
-var _ sync.Mutex
 
 // NewMux is the legacy single-engine wrapper. The returned handler
 // exposes /healthz + /run + /run/stream against the supplied Engine.
@@ -426,6 +417,28 @@ func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleRunStream(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	// Resumable (HITL) runs are sync-only by design — the v2 engine returns
+	// a suspension via RunResult, not the v0.1 SSE event channel this
+	// endpoint streams. Peek the body (mirroring handleRun) and reject a
+	// {"resumable":true} request with 400 rather than silently running the
+	// v0.1 path. The body is buffered + restored so the non-resumable path
+	// re-decodes byte-identically.
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("read body: %w", err))
+		return
+	}
+	var req runRequest
+	if derr := decodeJSON(bytesReader(body), &req); derr != nil {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("decode body: %w", derr))
+		return
+	}
+	if req.Resumable {
+		writeError(w, http.StatusBadRequest,
+			errors.New("resumable runs are not supported on the streaming endpoint; use POST /flows/{id}/run"))
+		return
+	}
+	r.Body = io.NopCloser(bytesReader(body))
 	s.runWithStore(w, r, id, true)
 }
 
@@ -780,6 +793,15 @@ func (s *Server) handleResumeRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Only a suspended run may be resumed. A completed/failed run still
+	// carries its resume_token + checkpoint, so without this guard a second
+	// resume would re-run the post-interrupt nodes (side-effect double-fire).
+	if rec.Status != flowstore.RunStatusSuspended {
+		writeError(w, http.StatusConflict,
+			fmt.Errorf("run %q is not suspended (status %q)", runID, rec.Status))
+		return
+	}
+
 	eng, err := s.engineForV2(rec.FlowID)
 	if errors.Is(err, flowstore.ErrNotFound) {
 		writeError(w, http.StatusNotFound, fmt.Errorf("flow %q not found", rec.FlowID))
@@ -810,6 +832,12 @@ func (s *Server) handleResumeRun(w http.ResponseWriter, r *http.Request) {
 	s.appendV2Event(runID, flowstore.RunEventFlowDone, "",
 		map[string]any{"outputs": outputs})
 	s.persistFinish(runID, outputs, nil)
+	// The checkpoint is now consumed — delete it so a stale resume_token
+	// can't be replayed (the not-suspended guard above is the primary
+	// defense; this reclaims storage). Log on error; don't fail the response.
+	if derr := s.cfg.V2Checkpoints.DeleteCheckpoint(serverCtxFor(s), runID); derr != nil {
+		s.cfg.Logger.Printf("flowd: DeleteCheckpoint %s: %v", runID, derr)
+	}
 	writeJSON(w, http.StatusOK, runResponse{Outputs: outputs, RunID: runID})
 }
 

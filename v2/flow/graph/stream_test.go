@@ -380,3 +380,41 @@ func settleGoroutines() int {
 	}
 	return prev
 }
+
+// trackingAnyStream is a minimal StreamReader[any] that records whether
+// Close was called and how many times.
+type trackingAnyStream struct {
+	closeCount int
+}
+
+func (t *trackingAnyStream) Next() (any, error) { return nil, io.EOF }
+func (t *trackingAnyStream) Close() error       { t.closeCount++; return nil }
+
+// TestFoldTail_PanicReleasesUpstream — if the folder panics, foldTailReader
+// must still release (Close) the upstream stream exactly once.
+func TestFoldTail_PanicReleasesUpstream(t *testing.T) {
+	up := &trackingAnyStream{}
+	ft := foldTail[string](up, func(StreamReader[any]) (any, error) {
+		panic("boom")
+	})
+
+	func() {
+		defer func() {
+			if r := recover(); r == nil {
+				t.Fatalf("expected panic from folder, got none")
+			}
+		}()
+		_, _ = ft.Next()
+	}()
+
+	if up.closeCount != 1 {
+		t.Fatalf("upstream closeCount = %d, want 1 (released exactly once on fold panic)", up.closeCount)
+	}
+	// A subsequent Close must be a no-op (idempotent), not a second release.
+	if err := ft.Close(); err != nil {
+		t.Fatalf("Close after panic: %v", err)
+	}
+	if up.closeCount != 1 {
+		t.Fatalf("upstream closeCount = %d after extra Close, want still 1", up.closeCount)
+	}
+}

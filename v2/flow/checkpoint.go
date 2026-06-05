@@ -42,6 +42,50 @@ type Checkpoint struct {
 	CreatedAt       time.Time                  `json:"created_at"`
 }
 
+// clone returns a deep copy of cp's reference-type fields (Activated, the
+// two-level PortValues, EdgeStates, OriginalInputs) so a caller mutating a
+// loaded Checkpoint cannot corrupt a store's retained copy, and vice versa.
+// json.RawMessage values are treated as immutable, so copying the map/slice
+// structure (not the underlying bytes) suffices. Scalars + InterruptReq copy
+// by value.
+func (cp Checkpoint) clone() Checkpoint {
+	if cp.Activated != nil {
+		act := make(map[string]bool, len(cp.Activated))
+		for k, v := range cp.Activated {
+			act[k] = v
+		}
+		cp.Activated = act
+	}
+	if cp.PortValues != nil {
+		pv := make(map[string]map[string]json.RawMessage, len(cp.PortValues))
+		for node, ports := range cp.PortValues {
+			if ports == nil {
+				pv[node] = nil
+				continue
+			}
+			inner := make(map[string]json.RawMessage, len(ports))
+			for port, raw := range ports {
+				inner[port] = raw
+			}
+			pv[node] = inner
+		}
+		cp.PortValues = pv
+	}
+	if cp.EdgeStates != nil {
+		es := make([]EdgeFireState, len(cp.EdgeStates))
+		copy(es, cp.EdgeStates)
+		cp.EdgeStates = es
+	}
+	if cp.OriginalInputs != nil {
+		oi := make(map[string]json.RawMessage, len(cp.OriginalInputs))
+		for k, raw := range cp.OriginalInputs {
+			oi[k] = raw
+		}
+		cp.OriginalInputs = oi
+	}
+	return cp
+}
+
 // CheckpointMeta is the lightweight listing projection of a Checkpoint.
 type CheckpointMeta struct {
 	RunID, FlowID, InterruptNodeID string
@@ -107,7 +151,7 @@ func NewMemoryCheckpointStore() *MemoryCheckpointStore {
 func (s *MemoryCheckpointStore) SaveCheckpoint(ctx context.Context, cp Checkpoint) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.m[cp.RunID] = cp
+	s.m[cp.RunID] = cp.clone()
 	return nil
 }
 
@@ -118,7 +162,7 @@ func (s *MemoryCheckpointStore) LoadCheckpoint(ctx context.Context, token string
 	if !ok {
 		return Checkpoint{}, ErrCheckpointNotFound
 	}
-	return cp, nil
+	return cp.clone(), nil
 }
 
 func (s *MemoryCheckpointStore) DeleteCheckpoint(ctx context.Context, token string) error {

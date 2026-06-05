@@ -157,12 +157,15 @@ func Compile(f Flow, reg *NodeRegistry, deps Deps, opts ...EngineOption) (*Engin
 	}
 
 	// FlowHash: sha256 of the canonical v2 Flow JSON. Used on Resume to
-	// reject a checkpoint whose flow definition changed.
-	var flowHash string
-	if b, err := Marshal(f); err == nil {
-		sum := sha256.Sum256(b)
-		flowHash = hex.EncodeToString(sum[:])
+	// reject a checkpoint whose flow definition changed. A Marshal failure
+	// must fail Compile rather than leave flowHash empty — an empty hash
+	// would silently disable the ErrFlowChanged guard.
+	b, err := Marshal(f)
+	if err != nil {
+		return nil, fmt.Errorf("flow: compile: hash flow: %w", err)
 	}
+	sum := sha256.Sum256(b)
+	flowHash := hex.EncodeToString(sum[:])
 
 	// Static multi-interrupt check (RV-2): only when a CheckpointStore is
 	// configured. At most one interrupt-capable node per layer — otherwise

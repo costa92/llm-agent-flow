@@ -252,4 +252,12 @@ func TestFlowd_ResumeDrivesToDone(t *testing.T) {
 	if !strings.Contains(suspendedData, "request") {
 		t.Fatalf("flow_suspended data missing request: %s", suspendedData)
 	}
+
+	// A SECOND resume of the now-completed run must be rejected with 409 —
+	// NOT silently re-run (which would re-fire post-interrupt side effects).
+	secondResp := mustPOST(t, srv.URL+"/flows/hitl/runs/"+runID+"/resume", `{"decision":"approved"}`)
+	defer secondResp.Body.Close()
+	if secondResp.StatusCode != http.StatusConflict {
+		t.Fatalf("second resume status = %d, want 409", secondResp.StatusCode)
+	}
 }

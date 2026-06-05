@@ -306,6 +306,10 @@ func (r *Runnable[I, O]) Invoke(ctx context.Context, in I) (O, error) {
 // unboxed to O — callers wanting the typed result should use Invoke. This
 // is the engine-driven observability stream, distinct from the data-level
 // Stream below.
+//
+// Caller obligation: the returned channel MUST be drained to completion (or
+// the supplied ctx cancelled), otherwise the engine goroutine parks blocked
+// on a channel send and leaks — mirroring Stream's Close obligation.
 func (r *Runnable[I, O]) Events(ctx context.Context, in I) (<-chan flow.Event, error) {
 	return r.engine.RunStream(ctx, map[string]any{graphInputKey: in})
 }

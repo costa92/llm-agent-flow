@@ -125,6 +125,13 @@ func RegisterConcatenator[T, R any](fn Concatenator[T]) {
 }
 
 // lookupConcat returns the folder for downstream target type targetT.
+//
+// Known limitation: lookup is EXACT-type-only. A stream edge / output whose
+// downstream type is an INTERFACE that the produced concrete type merely
+// implements has no registered folder under that interface type, so Stream
+// is more restrictive than Invoke here: such graphs Compile fine for Invoke
+// but error under Stream ("no Concatenator for <iface>"). An assignability
+// scan over registered folders is deferred to Phase 2.
 func lookupConcat(targetT reflect.Type) (func(StreamReader[any]) (any, error), bool) {
 	concatRegistryMu.RLock()
 	defer concatRegistryMu.RUnlock()
@@ -233,7 +240,14 @@ func (f *foldTailReader[O]) Next() (O, error) {
 		return zero, io.EOF
 	}
 	f.done = true
-	v, err := f.fold(f.stream) // drains + closes the underlying stream
+	// fold drains + closes the underlying stream on its normal path, but if
+	// it PANICS the upstream would never be released. defer a close so the
+	// source is released exactly once even on a fold panic; the underlying
+	// Close is idempotent, so the (success-path) double close is a no-op.
+	// Mark closed so a later Close() is a guaranteed no-op.
+	f.closed = true
+	defer f.stream.Close()
+	v, err := f.fold(f.stream)
 	if err != nil {
 		return zero, err
 	}
