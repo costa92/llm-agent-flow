@@ -22,6 +22,8 @@ type Config struct
 	field Registry *flow.NodeRegistry
 	field Store flowstore.Store
 	field Tools flow.ToolMap
+	field V2Checkpoints v2flow.CheckpointStore
+	field V2Registry *v2flow.NodeRegistry
 type Server struct
 var ErrUnauthorized = errors.New("unauthorized")
 package github.com/costa92/llm-agent-flow/examples/echo_chain
@@ -133,7 +135,9 @@ package github.com/costa92/llm-agent-flow/flow/store
 const RunEventFlowDone RunEventKind = "flow_done"
 const RunEventFlowErr RunEventKind = "flow_err"
 const RunEventFlowStarted RunEventKind = "flow_started"
+const RunEventFlowSuspended RunEventKind = "flow_suspended"
 const RunEventNodeFinished RunEventKind = "node_finished"
+const RunEventNodeInterrupted RunEventKind = "node_interrupted"
 const RunEventNodeSkipped RunEventKind = "node_skipped"
 const RunEventNodeStarted RunEventKind = "node_started"
 const RunStatusDone RunStatus = "done"
@@ -168,7 +172,9 @@ type RunMeta struct
 type RunRecord struct
 	field Error string
 	field Inputs map[string]string
+	field InterruptNode string
 	field Outputs map[string]string
+	field ResumeToken string
 	field RunMeta
 type RunStatus string
 type Store interface

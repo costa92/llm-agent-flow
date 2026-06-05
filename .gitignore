@@ -6,3 +6,6 @@
 /dist/
 *.test
 *.out
+
+# compiled flowd binary (build artifact)
+/flowd

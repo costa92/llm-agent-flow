@@ -27,6 +27,7 @@ import (
 
 	"github.com/costa92/llm-agent-flow/flow"
 	flowstore "github.com/costa92/llm-agent-flow/flow/store"
+	v2flow "github.com/costa92/llm-agent-flow/v2/flow"
 )
 
 // Ensure stdlib sync stays used (runWithStore still uses sync.Mutex
@@ -79,13 +80,22 @@ type Config struct {
 	// behavior). A positive value enables LRU eviction once the
 	// cache reaches that size; entries are touched on every run.
 	EngineCacheSize int
+
+	// V2Registry / V2Checkpoints enable the additive flowd v2 resumable
+	// (HITL) path. When BOTH are non-nil, the run handler honors a
+	// {"resumable":true} request opt-in and the resume route is
+	// registered. When either is nil the server behaves exactly as
+	// v0.1 — the v2 path is fully gated.
+	V2Registry    *v2flow.NodeRegistry
+	V2Checkpoints v2flow.CheckpointStore
 }
 
 // Server is the v0.0.5 store-backed HTTP layer. Concurrent-safe;
 // construct once and serve forever.
 type Server struct {
-	cfg     Config
-	engines *engineCache // LRU-bounded compiled-flow cache
+	cfg       Config
+	engines   *engineCache // LRU-bounded compiled-flow cache (v0.1)
+	enginesV2 *engineCache // separate cache for compiled v2 engines
 }
 
 // New returns a Server wired with the supplied Config.
@@ -99,7 +109,11 @@ func New(cfg Config) (*Server, error) {
 	if cfg.Logger == nil {
 		cfg.Logger = log.Default()
 	}
-	return &Server{cfg: cfg, engines: newEngineCache(cfg.EngineCacheSize)}, nil
+	return &Server{
+		cfg:       cfg,
+		engines:   newEngineCache(cfg.EngineCacheSize),
+		enginesV2: newEngineCache(cfg.EngineCacheSize),
+	}, nil
 }
 
 // Handler returns the HTTP handler this Server serves.
@@ -121,6 +135,12 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /runs/{id}/events", s.handleListRunEvents)
 	mux.HandleFunc("POST /runs/{id}/replay", s.handleReplayRun)
 
+	// Additive v2 resumable (HITL) resume route — registered only when
+	// the v2 engine path is fully wired.
+	if s.cfg.V2Registry != nil && s.cfg.V2Checkpoints != nil {
+		mux.HandleFunc("POST /flows/{id}/runs/{runID}/resume", s.handleResumeRun)
+	}
+
 	// Legacy single-flow routes for v0.0.4 backward compat.
 	if s.cfg.LegacyFlowID != "" {
 		mux.HandleFunc("POST /run", s.handleLegacyRun)
@@ -134,6 +154,7 @@ func (s *Server) Handler() http.Handler {
 // with the caller.
 func (s *Server) Close() {
 	s.engines = newEngineCache(s.cfg.EngineCacheSize)
+	s.enginesV2 = newEngineCache(s.cfg.EngineCacheSize)
 }
 
 // engineFor returns the compiled Engine for id, lazily compiling +
@@ -162,7 +183,37 @@ func (s *Server) engineFor(id string) (*flow.Engine, *flowstore.FlowRecord, erro
 	return eng, &rec, nil
 }
 
-func (s *Server) engineEvict(id string) { s.engines.Delete(id) }
+func (s *Server) engineEvict(id string) {
+	s.engines.Delete(id)
+	if s.enginesV2 != nil {
+		s.enginesV2.Delete(id)
+	}
+}
+
+// engineForV2 mirrors engineFor but builds a v2 engine (any-carrier,
+// checkpoint-enabled) and caches it in the separate enginesV2 LRU. The
+// stored flow JSON is the v0.1 IR, which the v2 loader accepts unchanged
+// (v2 JSON is a superset). Returns flowstore.ErrNotFound for unknown ids.
+func (s *Server) engineForV2(id string) (*v2flow.Engine, error) {
+	if v, ok := s.enginesV2.Get(id); ok {
+		return v.(*v2flow.Engine), nil
+	}
+	rec, err := s.cfg.Store.GetFlow(serverCtxFor(s), id)
+	if err != nil {
+		return nil, err
+	}
+	eng, err := v2flow.LoadCompile(
+		bytesReader(rec.JSON),
+		s.cfg.V2Registry,
+		v2flow.Deps{},
+		v2flow.WithCheckpointStore(s.cfg.V2Checkpoints),
+	)
+	if err != nil {
+		return nil, err
+	}
+	s.enginesV2.Set(id, eng)
+	return eng, nil
+}
 
 // healthHandler is shared between legacy NewMux and New.Handler.
 func healthHandler(w http.ResponseWriter, _ *http.Request) {
@@ -176,11 +227,24 @@ func healthHandler(w http.ResponseWriter, _ *http.Request) {
 
 type runRequest struct {
 	Inputs map[string]string `json:"inputs"`
+	// Resumable opts a run into the additive v2 resumable (HITL) engine
+	// path. Honored only when the server is configured with a V2Registry
+	// + V2Checkpoints; otherwise ignored and the v0.1 path runs.
+	Resumable bool `json:"resumable,omitempty"`
+}
+
+// suspendedInfo is the resume handle surfaced to the client when a v2 run
+// pauses awaiting human input.
+type suspendedInfo struct {
+	ResumeToken string                  `json:"resume_token"`
+	NodeID      string                  `json:"node"`
+	Request     v2flow.InterruptRequest `json:"request"`
 }
 
 type runResponse struct {
-	Outputs map[string]string `json:"outputs"`
-	RunID   string            `json:"run_id,omitempty"`
+	Outputs   map[string]string `json:"outputs"`
+	RunID     string            `json:"run_id,omitempty"`
+	Suspended *suspendedInfo    `json:"suspended,omitempty"`
 }
 
 type errorResponse struct {
@@ -339,6 +403,24 @@ func (s *Server) handleDeleteFlow(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	// Peek at the request to honor the {"resumable":true} opt-in. The
+	// body is buffered + restored so the v0.1 sync path (runWithStore)
+	// re-decodes exactly as before.
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("read body: %w", err))
+		return
+	}
+	var req runRequest
+	if derr := decodeJSON(bytesReader(body), &req); derr != nil {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("decode body: %w", derr))
+		return
+	}
+	if req.Resumable && s.cfg.V2Registry != nil {
+		s.runResumableV2(w, r, id, req)
+		return
+	}
+	r.Body = io.NopCloser(bytesReader(body))
 	s.runWithStore(w, r, id, false)
 }
 
@@ -603,6 +685,234 @@ func (s *Server) handleListRunsForFlow(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"runs": runs})
+}
+
+// ----------------------------------------------------------------------
+// v2 resumable (HITL) path — additive, gated behind {"resumable":true}
+// + a configured V2Registry/V2Checkpoints. The v2 engine's
+// RunResumable/Resume take NO event channel and DISCARD suspensions on
+// RunStream, so the persisted/SSE events are SYNTHESIZED here from the
+// returned RunResult rather than flowing through the v0.1 RunStream loop.
+// ----------------------------------------------------------------------
+
+// suspender is the optional store capability for recording a HITL pause.
+// Type-asserted (mirroring the AppendRunEvents pattern) so the Store
+// interface stays unchanged.
+type suspender interface {
+	SuspendRun(ctx context.Context, runID, resumeToken, interruptNodeID string) error
+}
+
+// runResumableV2 drives a fresh resumable run. On suspend it records the
+// HITL events + marks the run suspended (NOT finalized) and returns the
+// resume handle; on completion it synthesizes flow_done + finalizes.
+func (s *Server) runResumableV2(w http.ResponseWriter, r *http.Request, flowID string, req runRequest) {
+	eng, err := s.engineForV2(flowID)
+	if errors.Is(err, flowstore.ErrNotFound) {
+		writeError(w, http.StatusNotFound, fmt.Errorf("flow %q not found", flowID))
+		return
+	}
+	if err != nil {
+		s.cfg.Logger.Printf("flowd: engineForV2 %q: %v", flowID, err)
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+
+	runID, serr := s.cfg.Store.StartRun(r.Context(), flowID, req.Inputs)
+	if serr != nil {
+		s.cfg.Logger.Printf("flowd: StartRun: %v", serr)
+		writeError(w, http.StatusInternalServerError, serr)
+		return
+	}
+	w.Header().Set("X-Run-ID", runID)
+
+	// Synthesized flow_started so the replay history is coherent.
+	s.appendV2Event(runID, flowstore.RunEventFlowStarted, "",
+		streamPayloadV2(v2flow.Event{Kind: v2flow.FlowStarted, FlowID: flowID}))
+
+	inputsAny := make(map[string]any, len(req.Inputs))
+	for k, v := range req.Inputs {
+		inputsAny[k] = v
+	}
+
+	res, rerr := eng.RunResumable(r.Context(), runID, inputsAny)
+	if rerr != nil {
+		s.appendV2Event(runID, flowstore.RunEventFlowErr, "",
+			map[string]any{"error": rerr.Error()})
+		s.persistFinish(runID, nil, rerr)
+		s.cfg.Logger.Printf("flowd: RunResumable %s: %v", runID, rerr)
+		writeError(w, http.StatusInternalServerError, rerr)
+		return
+	}
+
+	if res.Suspended != nil {
+		s.persistSuspension(runID, res.Suspended)
+		writeJSON(w, http.StatusOK, runResponse{
+			RunID:     runID,
+			Suspended: suspendedInfoFrom(res.Suspended),
+		})
+		return
+	}
+
+	outputs := stringifyOutputs(res.Outputs)
+	s.appendV2Event(runID, flowstore.RunEventFlowDone, "",
+		map[string]any{"outputs": outputs})
+	s.persistFinish(runID, outputs, nil)
+	writeJSON(w, http.StatusOK, runResponse{Outputs: outputs, RunID: runID})
+}
+
+// handleResumeRun continues a suspended run with the supplied human input.
+func (s *Server) handleResumeRun(w http.ResponseWriter, r *http.Request) {
+	var humanInput map[string]any
+	if err := decodeJSON(r.Body, &humanInput); err != nil {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("decode body: %w", err))
+		return
+	}
+
+	runID := r.PathValue("runID")
+	rec, err := s.cfg.Store.GetRun(r.Context(), runID)
+	if errors.Is(err, flowstore.ErrNotFound) {
+		writeError(w, http.StatusNotFound, fmt.Errorf("run %q not found", runID))
+		return
+	}
+	if err != nil {
+		s.cfg.Logger.Printf("flowd: GET run %s for resume: %v", runID, err)
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+
+	eng, err := s.engineForV2(rec.FlowID)
+	if errors.Is(err, flowstore.ErrNotFound) {
+		writeError(w, http.StatusNotFound, fmt.Errorf("flow %q not found", rec.FlowID))
+		return
+	}
+	if err != nil {
+		s.cfg.Logger.Printf("flowd: engineForV2 %q: %v", rec.FlowID, err)
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+
+	res, rerr := eng.Resume(r.Context(), runID, rec.ResumeToken, humanInput)
+	if rerr != nil {
+		writeError(w, statusForResumeError(rerr), rerr)
+		return
+	}
+
+	if res.Suspended != nil {
+		s.persistSuspension(runID, res.Suspended)
+		writeJSON(w, http.StatusOK, runResponse{
+			RunID:     runID,
+			Suspended: suspendedInfoFrom(res.Suspended),
+		})
+		return
+	}
+
+	outputs := stringifyOutputs(res.Outputs)
+	s.appendV2Event(runID, flowstore.RunEventFlowDone, "",
+		map[string]any{"outputs": outputs})
+	s.persistFinish(runID, outputs, nil)
+	writeJSON(w, http.StatusOK, runResponse{Outputs: outputs, RunID: runID})
+}
+
+// persistSuspension records the node_interrupted + flow_suspended events
+// then marks the run suspended via the optional SuspendRun capability.
+// Falling back to persistFinish would finalize the run, which is wrong —
+// so without the capability we log and leave the run running.
+func (s *Server) persistSuspension(runID string, susp *v2flow.Suspension) {
+	s.appendV2Event(runID, flowstore.RunEventNodeInterrupted, susp.NodeID,
+		map[string]any{"node": susp.NodeID, "request": susp.Request})
+	s.appendV2Event(runID, flowstore.RunEventFlowSuspended, susp.NodeID,
+		map[string]any{"node": susp.NodeID, "resume_token": susp.ResumeToken, "request": susp.Request})
+	if sus, ok := s.cfg.Store.(suspender); ok {
+		if err := sus.SuspendRun(serverCtxFor(s), runID, susp.ResumeToken, susp.NodeID); err != nil {
+			s.cfg.Logger.Printf("flowd: SuspendRun %s: %v", runID, err)
+		}
+		return
+	}
+	s.cfg.Logger.Printf("flowd: store does not support SuspendRun; run %s left un-suspended", runID)
+}
+
+// appendV2Event persists one synthesized v2 event, JSON-encoding payload.
+func (s *Server) appendV2Event(runID string, kind flowstore.RunEventKind, nodeID string, payload map[string]any) {
+	if err := s.cfg.Store.AppendRunEvent(serverCtxFor(s), runID, kind, nodeID, mustJSON(payload)); err != nil {
+		s.cfg.Logger.Printf("flowd: AppendRunEvent %s (%s): %v", runID, kind, err)
+	}
+}
+
+func suspendedInfoFrom(susp *v2flow.Suspension) *suspendedInfo {
+	return &suspendedInfo{
+		ResumeToken: susp.ResumeToken,
+		NodeID:      susp.NodeID,
+		Request:     susp.Request,
+	}
+}
+
+// stringifyOutputs projects a v2 any-carrier output map to the v0.1
+// map[string]string shape the store + run response use, JSON-stringifying
+// any non-string value.
+func stringifyOutputs(out map[string]any) map[string]string {
+	if out == nil {
+		return nil
+	}
+	res := make(map[string]string, len(out))
+	for k, v := range out {
+		if sv, ok := v.(string); ok {
+			res[k] = sv
+			continue
+		}
+		raw, _ := json.Marshal(v)
+		res[k] = string(raw)
+	}
+	return res
+}
+
+// statusForResumeError maps the engine's resume sentinels to HTTP codes.
+func statusForResumeError(err error) int {
+	switch {
+	case errors.Is(err, v2flow.ErrInvalidHumanInput):
+		return http.StatusBadRequest
+	case errors.Is(err, v2flow.ErrCheckpointNotFound):
+		return http.StatusNotFound
+	case errors.Is(err, v2flow.ErrFlowChanged):
+		return http.StatusConflict
+	default:
+		return http.StatusInternalServerError
+	}
+}
+
+
+// streamPayloadV2 renders a v2 Event into the map payload shape persisted
+// + emitted as SSE. Mirrors the v0.1 streamPayload but covers the HITL
+// kinds (resume_token / request).
+func streamPayloadV2(ev v2flow.Event) map[string]any {
+	m := map[string]any{}
+	if ev.FlowID != "" {
+		m["flow"] = ev.FlowID
+	}
+	if ev.NodeID != "" {
+		m["node"] = ev.NodeID
+	}
+	if ev.Input != nil {
+		m["input"] = ev.Input
+	}
+	if ev.Output != nil {
+		m["output"] = ev.Output
+	}
+	if ev.Outputs != nil {
+		m["outputs"] = ev.Outputs
+	}
+	if ev.ResumeToken != "" {
+		m["resume_token"] = ev.ResumeToken
+	}
+	if ev.Request != nil {
+		m["request"] = ev.Request
+	}
+	if len(ev.Metadata) > 0 {
+		m["metadata"] = ev.Metadata
+	}
+	if ev.Err != nil {
+		m["error"] = ev.Err.Error()
+	}
+	return m
 }
 
 // ----------------------------------------------------------------------

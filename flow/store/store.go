@@ -52,6 +52,10 @@ type RunRecord struct {
 	Inputs  map[string]string `json:"inputs,omitempty"`
 	Outputs map[string]string `json:"outputs,omitempty"`
 	Error   string            `json:"error,omitempty"`
+	// ResumeToken / InterruptNode are populated for runs paused awaiting
+	// human input (RunStatusSuspended). Empty for ordinary runs.
+	ResumeToken   string `json:"resume_token,omitempty"`
+	InterruptNode string `json:"interrupt_node,omitempty"`
 }
 
 // RunEventKind enumerates the persisted run-event variants. The
@@ -66,6 +70,12 @@ const (
 	RunEventNodeSkipped  RunEventKind = "node_skipped"
 	RunEventFlowDone     RunEventKind = "flow_done"
 	RunEventFlowErr      RunEventKind = "flow_err"
+	// RunEventNodeInterrupted / RunEventFlowSuspended are the HITL
+	// (human-in-the-loop) event kinds synthesized by the flowd v2
+	// resumable path. They have no v0.1 RunStream source — the v2
+	// engine returns them via RunResult rather than an event channel.
+	RunEventNodeInterrupted RunEventKind = "node_interrupted"
+	RunEventFlowSuspended   RunEventKind = "flow_suspended"
 )
 
 // RunEvent is one row in a run's event history. Seq is 1-indexed and

@@ -100,18 +100,20 @@ func (s *Store) SuspendRun(ctx context.Context, runID, resumeToken, interruptNod
 // GetRun implements flow/store.Store.
 func (s *Store) GetRun(ctx context.Context, runID string) (flowstore.RunRecord, error) {
 	row := s.db.QueryRowContext(ctx,
-		`SELECT id, flow_id, status, started_at, finished_at, inputs_json, outputs_json, error_msg
+		`SELECT id, flow_id, status, started_at, finished_at, inputs_json, outputs_json, error_msg, resume_token, interrupt_node
 		   FROM runs WHERE id = ?`, runID)
 	var (
-		rec         flowstore.RunRecord
-		status      string
-		startedAt   int64
-		finishedAt  sql.NullInt64
-		inputsJSON  sql.NullString
-		outputsJSON sql.NullString
-		errMsg      sql.NullString
+		rec           flowstore.RunRecord
+		status        string
+		startedAt     int64
+		finishedAt    sql.NullInt64
+		inputsJSON    sql.NullString
+		outputsJSON   sql.NullString
+		errMsg        sql.NullString
+		resumeToken   sql.NullString
+		interruptNode sql.NullString
 	)
-	if err := row.Scan(&rec.ID, &rec.FlowID, &status, &startedAt, &finishedAt, &inputsJSON, &outputsJSON, &errMsg); err != nil {
+	if err := row.Scan(&rec.ID, &rec.FlowID, &status, &startedAt, &finishedAt, &inputsJSON, &outputsJSON, &errMsg, &resumeToken, &interruptNode); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return flowstore.RunRecord{}, flowstore.ErrNotFound
 		}
@@ -131,6 +133,12 @@ func (s *Store) GetRun(ctx context.Context, runID string) (flowstore.RunRecord, 
 	}
 	if errMsg.Valid {
 		rec.Error = errMsg.String
+	}
+	if resumeToken.Valid {
+		rec.ResumeToken = resumeToken.String
+	}
+	if interruptNode.Valid {
+		rec.InterruptNode = interruptNode.String
 	}
 	return rec, nil
 }

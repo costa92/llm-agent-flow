@@ -37,6 +37,8 @@ import (
 	flowstore "github.com/costa92/llm-agent-flow/flow/store"
 	sqlitestore "github.com/costa92/llm-agent-flow/flow/store/sqlite"
 	toolspkg "github.com/costa92/llm-agent-flow/flow/tools"
+	v2flow "github.com/costa92/llm-agent-flow/v2/flow"
+	v2sqlite "github.com/costa92/llm-agent-flow/v2/flow/store/sqlite"
 )
 
 func main() {
@@ -81,6 +83,21 @@ func main() {
 		os.Exit(1)
 	}
 
+	// v2 resumable (HITL) wiring. The checkpoint store shares the same
+	// DSN as the v0.1 store — the checkpoints table is additive and does
+	// not touch runs/events/flows.
+	v2reg := v2flow.NewNodeRegistry()
+	if err := registerV2Nodes(v2reg); err != nil {
+		fmt.Fprintln(os.Stderr, "flowd: register v2 nodes:", err)
+		os.Exit(1)
+	}
+	v2cp, err := v2sqlite.Open(*dbPath)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "flowd: open v2 checkpoint store:", err)
+		os.Exit(1)
+	}
+	defer v2cp.Close()
+
 	legacyID := ""
 	if *flowPath != "" {
 		id, err := seedFlow(store, *flowPath)
@@ -107,6 +124,8 @@ func main() {
 		Logger:             log.Default(),
 		LegacyFlowID:       legacyID,
 		Authenticator:      auth,
+		V2Registry:         v2reg,
+		V2Checkpoints:      v2cp,
 	}
 	flowdServer, err := server.New(srvCfg)
 	if err != nil {
