@@ -28,7 +28,12 @@ func AddChatModelNode[GI, GO any](g *Graph[GI, GO], id string, m llm.ChatModel) 
 	newKind := func() flow.NodeKind {
 		return &chatModelAdapter{id: id, m: m, inT: inT, outT: outT}
 	}
-	return g.addNode(id, inT, outT, newKind)
+	ref, err := g.addNode(id, inT, outT, newKind)
+	if err != nil {
+		return NodeRef{}, err
+	}
+	g.markInProcess(id, "chatmodel node holds an injected llm.ChatModel (use the JSON front-end with Deps-resolved nodes for a checkpointable flow)")
+	return ref, nil
 }
 
 // chatModelAdapter is the dedicated flow.NodeKind for a ChatModel node.
@@ -119,18 +124,30 @@ func (a anyStream[T]) Close() error { return a.sr.Close() }
 // prompt.Vars on "in" and emits the assembled llm.Request on "out".
 // Conversation history is not wired in this task (passed as nil).
 func AddTemplateNode[GI, GO any](g *Graph[GI, GO], id string, t prompt.Requester) (NodeRef, error) {
-	return AddLambdaNode[GI, GO, prompt.Vars, llm.Request](g, id,
+	ref, err := AddLambdaNode[GI, GO, prompt.Vars, llm.Request](g, id,
 		func(ctx context.Context, vars prompt.Vars) (llm.Request, error) {
 			return t.FormatRequest(ctx, vars, nil)
 		})
+	if err != nil {
+		return NodeRef{}, err
+	}
+	// Overwrite the generic lambda reason with the specific component one.
+	g.markInProcess(id, "template node holds an injected prompt.Requester (use the JSON front-end with Deps-resolved nodes for a checkpointable flow)")
+	return ref, nil
 }
 
 // AddToolNode adds a node that calls t.Execute. It takes the call
 // arguments as json.RawMessage on "in" and emits the tool's string result
 // on "out".
 func AddToolNode[GI, GO any](g *Graph[GI, GO], id string, t agents.Tool) (NodeRef, error) {
-	return AddLambdaNode[GI, GO, json.RawMessage, string](g, id,
+	ref, err := AddLambdaNode[GI, GO, json.RawMessage, string](g, id,
 		func(ctx context.Context, args json.RawMessage) (string, error) {
 			return t.Execute(ctx, args)
 		})
+	if err != nil {
+		return NodeRef{}, err
+	}
+	// Overwrite the generic lambda reason with the specific component one.
+	g.markInProcess(id, "tool node holds an injected agents.Tool (use the JSON front-end with Deps-resolved nodes for a checkpointable flow)")
+	return ref, nil
 }

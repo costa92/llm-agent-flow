@@ -60,6 +60,7 @@ func AddBranch[GI, GO, T any](g *Graph[GI, GO], id string, key func(context.Cont
 	if err != nil {
 		return NodeRef{}, err
 	}
+	g.markInProcess(id, "branch node holds a Go key function (in-process only)")
 
 	// Register one edge per route: branch.<key> -> target.in.
 	for k, target := range routes {

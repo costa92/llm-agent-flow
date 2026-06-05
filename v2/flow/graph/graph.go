@@ -12,6 +12,7 @@ package graph
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"reflect"
 
@@ -67,19 +68,51 @@ type Graph[I, O any] struct {
 	entry *NodeRef
 	exit  *NodeRef
 
+	// lowering records, per node id, the serializable IR descriptor — set
+	// iff the node has a serializable form (no Go closure / injected dep).
+	// A node is serializable iff lowering[id] != nil.
+	lowering map[string]*nodeLowering
+	// reasons records, per node id, the human reason a node is NOT
+	// serializable. Exactly one of lowering[id] / reasons[id] is set per
+	// node-adding function.
+	reasons map[string]string
+
 	// latchedErr holds the first build-time type/usage error so Compile
 	// can report it even when AddEdge's return value was ignored.
 	latchedErr error
+}
+
+// nodeLowering is the serializable IR descriptor of a node: the globally
+// registered node-type string and its JSON config (nil if none needed).
+type nodeLowering struct {
+	typ    string
+	config json.RawMessage
 }
 
 // NewGraph returns an empty typed graph with input type I and output
 // type O.
 func NewGraph[I, O any]() *Graph[I, O] {
 	return &Graph[I, O]{
-		inT:  reflect.TypeFor[I](),
-		outT: reflect.TypeFor[O](),
-		byID: make(map[string]NodeRef),
+		inT:      reflect.TypeFor[I](),
+		outT:     reflect.TypeFor[O](),
+		byID:     make(map[string]NodeRef),
+		lowering: make(map[string]*nodeLowering),
+		reasons:  make(map[string]string),
 	}
+}
+
+// markSerializable records that node id has a serializable IR form of the
+// given type and config. A node so marked lowers into the JSON IR.
+func (g *Graph[I, O]) markSerializable(id, typ string, config json.RawMessage) {
+	g.lowering[id] = &nodeLowering{typ: typ, config: config}
+}
+
+// markInProcess records that node id is in-process only (no serializable
+// form), with a human reason. It overwrites any prior reason and clears any
+// lowering entry so the node is unambiguously non-serializable.
+func (g *Graph[I, O]) markInProcess(id, reason string) {
+	g.reasons[id] = reason
+	delete(g.lowering, id)
 }
 
 // latch records err as the graph's first build error if none is set yet,
@@ -117,13 +150,47 @@ func AddLambdaNode[GI, GO, In, Out any](g *Graph[GI, GO], id string, fn func(con
 	newKind := func() flow.NodeKind {
 		return &lambdaAdapter[In, Out]{id: id, fn: fn, inT: inT, outT: outT}
 	}
-	return g.addNode(id, inT, outT, newKind)
+	ref, err := g.addNode(id, inT, outT, newKind)
+	if err != nil {
+		return NodeRef{}, err
+	}
+	g.markInProcess(id, "lambda node holds a Go closure (in-process only)")
+	return ref, nil
 }
 
-// AddPassthroughNode adds an identity node carrying a value of type T
-// from its in port to its out port unchanged.
+// AddPassthroughNode adds an identity node carrying a value of type T from
+// its in port to its out port unchanged. Unlike Lambda it is serializable
+// (builtin.passthrough): it holds no Go closure, so it round-trips through
+// JSON and recompiles against NewBuiltinRegistry.
 func AddPassthroughNode[GI, GO, T any](g *Graph[GI, GO], id string) (NodeRef, error) {
-	return AddLambdaNode[GI, GO, T, T](g, id, func(_ context.Context, v T) (T, error) { return v, nil })
+	t := reflect.TypeFor[T]()
+	newKind := func() flow.NodeKind { return &passthroughAdapter{id: id, t: t} }
+	ref, err := g.addNode(id, t, t, newKind)
+	if err != nil {
+		return NodeRef{}, err
+	}
+	g.markSerializable(id, builtinPassthrough, nil)
+	return ref, nil
+}
+
+// passthroughAdapter is the flow.NodeKind for an identity node: it forwards
+// the value on its in port to its out port unchanged. It is serializable
+// (builtin.passthrough) because it holds no Go closure — the runtime form
+// rebuilt from JSON operates on any and forwards regardless of element type.
+type passthroughAdapter struct {
+	id string
+	t  reflect.Type // declared port Go type; nil when rebuilt from JSON
+}
+
+func (a *passthroughAdapter) Inputs() []flow.Port  { return []flow.Port{{Name: portIn, GoType: a.t}} }
+func (a *passthroughAdapter) Outputs() []flow.Port { return []flow.Port{{Name: portOut, GoType: a.t}} }
+
+func (a *passthroughAdapter) Run(_ context.Context, in map[string]any) (map[string]any, error) {
+	raw, ok := in[portIn]
+	if !ok {
+		return nil, fmt.Errorf("graph: passthrough %q: missing input port %q", a.id, portIn)
+	}
+	return map[string]any{portOut: raw}, nil
 }
 
 // lambdaAdapter is the flow.NodeKind that wraps a typed closure. It

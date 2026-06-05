@@ -29,6 +29,13 @@ type Runnable[I, O any] struct {
 	inT      reflect.Type
 	outT     reflect.Type
 	pipeline *linearPipeline
+
+	// serializable reports whether every node lowered to a JSON IR form.
+	// lowered holds that IR (valid iff serializable); lowerErr holds the
+	// node-level reason(s) it did not (valid iff !serializable).
+	serializable bool
+	lowered      flow.Flow
+	lowerErr     error
 }
 
 // linearPipeline is the ordered node chain for a linear graph plus the
@@ -50,6 +57,29 @@ type pipelineNode struct {
 // StreamCapable reports whether Stream runs as a true data-level stream
 // (linear chain) rather than degrading to box(Invoke).
 func (r *Runnable[I, O]) StreamCapable() bool { return r.pipeline != nil }
+
+// Serializable reports whether the graph lowered fully to JSON IR — every
+// node has a serializable form (no Go closure / injected dependency). Only
+// serializable graphs can round-trip through Marshal/Load and be made
+// checkpointable.
+func (r *Runnable[I, O]) Serializable() bool { return r.serializable }
+
+// Checkpointable reports whether a run of this graph can be checkpointed.
+// In v2 MVP it equals Serializable(): a live in-flight StreamReader at a
+// layer boundary is the only additional disqualifier and is a runtime
+// concern handled at suspend time (ErrNotCheckpointable), not knowable here.
+func (r *Runnable[I, O]) Checkpointable() bool { return r.serializable }
+
+// Lower returns the serializable flow.Flow IR for this graph. It errors
+// (listing the offending nodes and why) when the graph is not
+// serializable. The returned Flow round-trips through flow.Marshal /
+// flow.Load and recompiles against NewBuiltinRegistry().
+func (r *Runnable[I, O]) Lower() (flow.Flow, error) {
+	if !r.serializable {
+		return flow.Flow{}, r.lowerErr
+	}
+	return r.lowered, nil
+}
 
 // Compile re-validates the graph (including any latched build error),
 // lowers it to a task-1 flow.Flow + in-process NodeRegistry, and returns
@@ -134,7 +164,20 @@ func (g *Graph[I, O]) Compile(_ context.Context, opts ...flow.EngineOption) (*Ru
 	if err != nil {
 		return nil, err
 	}
-	return &Runnable[I, O]{engine: engine, inT: g.inT, outT: g.outT, pipeline: pipeline}, nil
+
+	// Compute the serializable lowering separately from the in-process
+	// engine path above: it succeeds only when every node has a JSON IR
+	// form (no Go closure / injected dependency).
+	lf, lerr := g.lower()
+	return &Runnable[I, O]{
+		engine:       engine,
+		inT:          g.inT,
+		outT:         g.outT,
+		pipeline:     pipeline,
+		serializable: lerr == nil,
+		lowered:      lf,
+		lowerErr:     lerr,
+	}, nil
 }
 
 // buildLinearPipeline analyses the graph for the linear-chain shape and,
