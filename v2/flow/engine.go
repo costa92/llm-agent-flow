@@ -222,7 +222,7 @@ func Compile(f Flow, reg *NodeRegistry, deps Deps, opts ...EngineOption) (*Engin
 // are omitted from the returned map rather than reported as an error —
 // this is what makes conditional routing usable.
 func (e *Engine) Run(ctx context.Context, inputs map[string]any) (map[string]any, error) {
-	out, _, err := e.runCore(ctx, inputs, nil, "", false, nil)
+	out, _, err := e.runCore(ctx, inputs, nil, "", false, nil, nil)
 	return out, err
 }
 
@@ -233,7 +233,7 @@ func (e *Engine) RunStream(ctx context.Context, inputs map[string]any) (<-chan E
 	ch := make(chan Event, 16)
 	go func() {
 		defer close(ch)
-		_, _, _ = e.runCore(ctx, inputs, ch, "", false, nil)
+		_, _, _ = e.runCore(ctx, inputs, ch, "", false, nil, nil)
 	}()
 	return ch, nil
 }
@@ -259,7 +259,9 @@ type pendingInterrupt struct {
 // FlowStarted/Inputs init and starts at seed.startLayer). Returns
 // (outputs, suspension, err): suspension is non-nil only when the run
 // suspended on an interrupt.
-func (e *Engine) runCore(ctx context.Context, inputs map[string]any, ch chan<- Event, runID string, checkpoint bool, seed *resumeSeed) (map[string]any, *Suspension, error) {
+// cell carries the run's State (nil when State is unused — the helpers are
+// inert and there is zero behavior change for existing flows).
+func (e *Engine) runCore(ctx context.Context, inputs map[string]any, ch chan<- Event, runID string, checkpoint bool, seed *resumeSeed, cell *stateCell) (map[string]any, *Suspension, error) {
 	// emit serializes channel sends from multiple node goroutines so
 	// consumers see one event at a time even though sibling nodes run in
 	// parallel.
@@ -446,7 +448,13 @@ func (e *Engine) runCore(ctx context.Context, inputs map[string]any, ch chan<- E
 			layerIDs = append(layerIDs, nodeID)
 			tasks = append(tasks, func(taskCtx context.Context) (map[string]any, error) {
 				emit(Event{Kind: NodeStarted, NodeID: nodeID, Input: cloneAnyMap(in)})
-				out, err := node.Run(taskCtx, in)
+				// Bind this node's id + the run's State cell into ctx so
+				// SetState stages under the right node. fanout.Run hands
+				// every sibling ONE shared runCtx, so the per-node id can
+				// only be set HERE, in the engine closure. A nil cell makes
+				// the helpers inert.
+				nodeCtx := withStateNode(taskCtx, cell, nodeID)
+				out, err := node.Run(nodeCtx, in)
 				if err != nil {
 					var ie *InterruptError
 					if checkpoint && errors.As(err, &ie) {
@@ -487,6 +495,20 @@ func (e *Engine) runCore(ctx context.Context, inputs map[string]any, ch chan<- E
 				_ = layerIDs[i]
 				emit(Event{Kind: FlowErr, Err: r.Err})
 				return nil, nil, r.Err
+			}
+		}
+
+		// Per-layer State barrier reduce. Pinned AFTER the error checks
+		// (an erroring layer early-returns above → commits no State,
+		// sibling-error-wins preserved) and BEFORE the suspend/checkpoint
+		// splice (so a checkpoint snapshots POST-reduce State). reduce
+		// acquires cell.mu and runs on the single engine goroutine, so a
+		// node leaking a goroutine that outlives Run cannot race the staged
+		// map. A default-reducer collision is treated as a layer error.
+		if cell != nil {
+			if err := cell.reduce(); err != nil {
+				emit(Event{Kind: FlowErr, Err: err})
+				return nil, nil, err
 			}
 		}
 

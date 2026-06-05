@@ -11,7 +11,7 @@ import (
 // otherwise Outputs is set. runID is the caller-owned run identity (see
 // NewRunID) under which any checkpoint is stored.
 func (e *Engine) RunResumable(ctx context.Context, runID string, inputs map[string]any) (RunResult, error) {
-	out, susp, err := e.runCore(ctx, inputs, nil, runID, true, nil)
+	out, susp, err := e.runCore(ctx, inputs, nil, runID, true, nil, nil)
 	if err != nil {
 		return RunResult{}, err
 	}
@@ -139,7 +139,7 @@ func (e *Engine) Resume(ctx context.Context, runID, token string, humanInput map
 		portValues: portValues,
 		edgeStates: edgeStates,
 		startLayer: cp.SuspendLayer + 1,
-	})
+	}, nil)
 	if err != nil {
 		return RunResult{}, err
 	}
