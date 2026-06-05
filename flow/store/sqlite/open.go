@@ -91,7 +91,9 @@ CREATE TABLE IF NOT EXISTS runs (
   finished_at   INTEGER,
   inputs_json   TEXT,
   outputs_json  TEXT,
-  error_msg     TEXT
+  error_msg     TEXT,
+  resume_token   TEXT NOT NULL DEFAULT '',
+  interrupt_node TEXT NOT NULL DEFAULT ''
 );
 
 CREATE INDEX IF NOT EXISTS idx_runs_flow_id_started_at
@@ -112,6 +114,22 @@ CREATE INDEX IF NOT EXISTS idx_run_events_run_id_seq
 `
 	if _, err := s.db.ExecContext(ctx, ddl); err != nil {
 		return fmt.Errorf("flow/store/sqlite: ensure schema: %w", err)
+	}
+	// Migration for pre-existing on-disk DBs: CREATE TABLE IF NOT EXISTS
+	// leaves an already-present `runs` table untouched, so the HITL
+	// columns must be added via ALTER. SQLite has no ADD COLUMN IF NOT
+	// EXISTS, so we run each ALTER and swallow the "duplicate column"
+	// error that fires on a DB created with the columns already in place.
+	for _, col := range []string{
+		`ALTER TABLE runs ADD COLUMN resume_token TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE runs ADD COLUMN interrupt_node TEXT NOT NULL DEFAULT ''`,
+	} {
+		if _, err := s.db.ExecContext(ctx, col); err != nil {
+			if containsCI(err.Error(), "duplicate column name") {
+				continue
+			}
+			return fmt.Errorf("flow/store/sqlite: migrate runs columns: %w", err)
+		}
 	}
 	return nil
 }

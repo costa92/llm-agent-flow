@@ -72,6 +72,14 @@ func Generate(moduleRoot string) (string, error) {
 			if path != moduleRoot && (strings.HasPrefix(name, ".") || name == "internal") {
 				return filepath.SkipDir
 			}
+			// Skip nested modules: a subdirectory with its own go.mod is a
+			// separate module (e.g. ./v2) with its own frozen API surface,
+			// not part of this module's baseline.
+			if path != moduleRoot {
+				if _, statErr := os.Stat(filepath.Join(path, "go.mod")); statErr == nil {
+					return filepath.SkipDir
+				}
+			}
 			return nil
 		}
 		if !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {

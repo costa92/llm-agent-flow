@@ -30,6 +30,10 @@ const (
 	RunStatusRunning RunStatus = "running"
 	RunStatusDone    RunStatus = "done"
 	RunStatusFailed  RunStatus = "failed"
+	// RunStatusSuspended marks a run paused awaiting human input (HITL).
+	// SuspendRun is an optional store capability (type-asserted by callers,
+	// mirroring AppendRunEvents) — it is NOT part of the Store interface.
+	RunStatusSuspended RunStatus = "suspended"
 )
 
 // RunMeta is the lightweight per-run record returned by ListRuns.

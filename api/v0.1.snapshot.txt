@@ -139,6 +139,7 @@ const RunEventNodeStarted RunEventKind = "node_started"
 const RunStatusDone RunStatus = "done"
 const RunStatusFailed RunStatus = "failed"
 const RunStatusRunning RunStatus = "running"
+const RunStatusSuspended RunStatus = "suspended"
 type FlowMeta struct
 	field CreatedAt time.Time
 	field ID string
@@ -198,6 +199,7 @@ method (*Store) ListRunEvents(ctx context.Context, runID string, limit int) ([]f
 method (*Store) ListRuns(ctx context.Context, flowID string, limit int) ([]flowstore.RunMeta, error)
 method (*Store) PutFlow(ctx context.Context, id, name string, jsonBytes []byte, create bool) (flowstore.FlowRecord, error)
 method (*Store) StartRun(ctx context.Context, flowID string, inputs map[string]string) (string, error)
+method (*Store) SuspendRun(ctx context.Context, runID, resumeToken, interruptNodeID string) error
 type Store struct
 package github.com/costa92/llm-agent-flow/flow/tools
 method (*KindRegistry) Build(m Manifest) ([]flow.Tool, error)
