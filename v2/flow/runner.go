@@ -28,6 +28,22 @@ type Runner interface {
 // Compile-time assertion that *Engine satisfies Runner.
 var _ Runner = (*Engine)(nil)
 
+// ResumableRunner extends Runner with the checkpoint/interrupt/resume
+// surface. An Engine compiled WithCheckpointStore satisfies this and can
+// suspend a run on a node interrupt, then resume it with human input.
+type ResumableRunner interface {
+	Runner
+	// RunResumable executes a fresh run that may suspend on an interrupt.
+	// On suspend, RunResult.Suspended is set; otherwise Outputs is set.
+	RunResumable(ctx context.Context, runID string, inputs map[string]any) (RunResult, error)
+	// Resume continues a suspended run identified by token, injecting
+	// humanInput as the interrupt node's output ports.
+	Resume(ctx context.Context, runID, token string, humanInput map[string]any) (RunResult, error)
+}
+
+// Compile-time assertion that *Engine satisfies ResumableRunner.
+var _ ResumableRunner = (*Engine)(nil)
+
 // FlowID returns the id of the compiled flow.
 func (e *Engine) FlowID() string { return e.flow.ID }
 
