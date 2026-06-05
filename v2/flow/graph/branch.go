@@ -81,6 +81,11 @@ type branchAdapter[T any] struct {
 	inT  reflect.Type
 }
 
+// routeKeys reports the branch's declared route-key output ports. It lets the
+// stream planner (buildStreamPlan) recognise a branch node via the branchKind
+// interface without a concrete type switch over every T instantiation.
+func (a *branchAdapter[T]) routeKeys() []string { return a.keys }
+
 func (a *branchAdapter[T]) Inputs() []flow.Port {
 	return []flow.Port{{Name: portIn, GoType: a.inT}}
 }

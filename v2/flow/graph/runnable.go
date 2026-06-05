@@ -29,6 +29,13 @@ type Runnable[I, O any] struct {
 	inT      reflect.Type
 	outT     reflect.Type
 	pipeline *linearPipeline
+	// streamPlan is non-nil only for a streamable BRANCH-DAG graph (a tree of
+	// value/stream nodes with branch fan-out, exactly one route taken at run
+	// time, no fan-in, no tee). When set — and pipeline is nil — Stream runs
+	// runStreamDAG; the linear path keeps using runLinearStream. Snapshotted at
+	// Compile (folder availability included); RegisterConcatenator after Compile
+	// does not retroactively change it.
+	streamPlan *streamPlan
 
 	// serializable reports whether every node lowered to a JSON IR form.
 	// lowered holds that IR (valid iff serializable); lowerErr holds the
@@ -55,8 +62,9 @@ type pipelineNode struct {
 }
 
 // StreamCapable reports whether Stream runs as a true data-level stream
-// (linear chain) rather than degrading to box(Invoke).
-func (r *Runnable[I, O]) StreamCapable() bool { return r.pipeline != nil }
+// (a linear chain OR a streamable branch-DAG) rather than degrading to
+// box(Invoke).
+func (r *Runnable[I, O]) StreamCapable() bool { return r.pipeline != nil || r.streamPlan != nil }
 
 // Serializable reports whether the graph lowered fully to JSON IR — every
 // node has a serializable form (no Go closure / injected dependency). Only
@@ -172,6 +180,20 @@ func (g *Graph[I, O]) Compile(_ context.Context, opts ...flow.EngineOption) (*Ru
 		return nil, err
 	}
 
+	// If not linear, try the streamable branch-DAG shape. buildStreamPlan
+	// returns (nil,nil) for any shape it can't prove streamable (degrade to
+	// box(Invoke)) and (nil,err) only when the graph IS a streamable branch-DAG
+	// but a required folder is missing — same escalation as buildLinearPipeline.
+	// Linear graphs keep pipeline != nil and streamPlan == nil (the byte-
+	// identical oracle path).
+	var splan *streamPlan
+	if pipeline == nil {
+		splan, err = g.buildStreamPlan()
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	// Compute the serializable lowering separately from the in-process
 	// engine path above: it succeeds only when every node has a JSON IR
 	// form (no Go closure / injected dependency).
@@ -181,6 +203,7 @@ func (g *Graph[I, O]) Compile(_ context.Context, opts ...flow.EngineOption) (*Ru
 		inT:          g.inT,
 		outT:         g.outT,
 		pipeline:     pipeline,
+		streamPlan:   splan,
 		serializable: lerr == nil,
 		lowered:      lf,
 		lowerErr:     lerr,
@@ -339,14 +362,20 @@ func (r *Runnable[I, O]) Events(ctx context.Context, in I) (<-chan flow.Event, e
 //     ChatModel node streams end-to-end; the tail is retyped (stream) or
 //     boxed (value) to StreamReader[O].
 func (r *Runnable[I, O]) Stream(ctx context.Context, in I) (StreamReader[O], error) {
-	if r.pipeline == nil {
+	switch {
+	case r.pipeline != nil:
+		return r.runLinearStream(ctx, in) // linear: byte-identical oracle path
+	case r.streamPlan != nil:
+		return r.runStreamDAG(ctx, in) // streamable branch-DAG
+	default:
+		// Degrade: non-linear, non-branch-DAG (or a tee/fan-in shape) → run
+		// Invoke to completion and box the single result. No error.
 		out, err := r.Invoke(ctx, in)
 		if err != nil {
 			return nil, err
 		}
 		return box(out), nil
 	}
-	return r.runLinearStream(ctx, in)
 }
 
 // runLinearStream is the dedicated data-stream execution path for a linear
@@ -359,13 +388,29 @@ func (r *Runnable[I, O]) Stream(ctx context.Context, in I) (StreamReader[O], err
 // a live single-pass iterator and is NOT checkpoint-eligible. Only the
 // seams where isStream == false hold a materialised, snapshottable value.
 // Task 5 implements no checkpointing — this is documented intent only.
-func (r *Runnable[I, O]) runLinearStream(ctx context.Context, in I) (StreamReader[O], error) {
+func (r *Runnable[I, O]) runLinearStream(ctx context.Context, in I) (_ StreamReader[O], retErr error) {
 	carrier := streamCarrier{value: in} // entry input is always a value
+
+	// Live-carrier cleanup: track the current in-flight stream so any error
+	// return BEFORE the tail is materialised releases it. concatToValue folds
+	// (and closes) the stream on the value/fold paths, so this is defensive for
+	// the linear shape today (a stream is only ever live between a streamNode
+	// and the very next fold); it is the SAME discipline runStreamDAG reuses,
+	// where a node's value-Run can error while a stream is still live.
+	var live liveCarrier
+	defer func() {
+		if retErr != nil {
+			live.closeIfLive()
+		}
+	}()
+
 	for _, n := range r.pipeline.nodes {
 		if n.stream != nil {
 			// Stream node: it needs a materialised input. If upstream is a
-			// stream, fold it to this node's In type first.
+			// stream, fold it to this node's In type first. concatToValue
+			// drains+closes that upstream, so it is no longer live.
 			if carrier.isStream {
+				live.clear()
 				v, err := concatToValue(carrier, n.inT)
 				if err != nil {
 					return nil, err
@@ -377,11 +422,13 @@ func (r *Runnable[I, O]) runLinearStream(ctx context.Context, in I) (StreamReade
 				return nil, err
 			}
 			carrier = out
+			live.set(carrier) // a fresh live stream we now own
 			continue
 		}
 		// Value node: fold any upstream stream down to its In type, then
 		// run the ordinary value path.
 		if carrier.isStream {
+			live.clear()
 			v, err := concatToValue(carrier, n.inT)
 			if err != nil {
 				return nil, err
@@ -394,6 +441,10 @@ func (r *Runnable[I, O]) runLinearStream(ctx context.Context, in I) (StreamReade
 		}
 		carrier = streamCarrier{value: out[portOut]}
 	}
+
+	// The tail materialiser takes ownership of any live stream (foldTail closes
+	// it; the value tail has none), so release our cleanup claim on it.
+	live.clear()
 
 	// Materialise the tail into StreamReader[O].
 	if carrier.isStream {

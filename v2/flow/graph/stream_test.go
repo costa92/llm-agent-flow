@@ -62,17 +62,21 @@ func (s *spyStream) wasClosed() bool {
 }
 
 // spyModel is a test llm.ChatModel whose Stream returns a shared spyStream
-// and records that Stream was invoked. Generate is unused on the stream
-// path but implemented for interface satisfaction.
+// and records that Stream was invoked. Generate returns the SAME text the
+// stream would accumulate (the join of the spy's deltas) so Invoke and Stream
+// are observably equivalent — the cross-validator the branch tests rely on.
+// generateCalled records whether the value path was taken.
 type spyModel struct {
-	sr           *spyStream
-	streamCalled bool
+	sr             *spyStream
+	streamCalled   bool
+	generateCalled bool
 }
 
 var _ llm.ChatModel = (*spyModel)(nil)
 
 func (m *spyModel) Generate(context.Context, llm.Request) (llm.Response, error) {
-	return llm.Response{Text: "generate-unused"}, nil
+	m.generateCalled = true
+	return llm.Response{Text: strings.Join(m.sr.deltas, "")}, nil
 }
 
 func (m *spyModel) Stream(context.Context, llm.Request) (llm.StreamReader, error) {
@@ -172,55 +176,68 @@ func TestStream_LinearChatModelStreams(t *testing.T) {
 	}
 }
 
-// TestStream_NonLinearDegrades: a graph containing a Branch is not
-// StreamCapable; Stream returns the Invoke result as a single element with
-// no error.
-func TestStream_NonLinearDegrades(t *testing.T) {
-	g := NewGraph[int, string]()
-	evenN, _ := AddLambdaNode(g, "even", func(_ context.Context, x int) (string, error) { return "even", nil })
-	oddN, _ := AddLambdaNode(g, "odd", func(_ context.Context, x int) (string, error) { return "odd", nil })
-	br, _ := AddBranch(g, "br", func(_ context.Context, x int) (string, error) {
-		if x%2 == 0 {
-			return "even", nil
+// TestStream_BranchValueDAGStreams: a value-only Branch DAG (branch ->
+// even/odd lambdas reconverging at a passthrough exit) is now a streamable
+// branch-DAG (Phase 3 item #1). It is StreamCapable and Stream returns the
+// selected route's result, identical to Invoke. (Previously branch graphs
+// degraded to box(Invoke); this is the intended behaviour change.)
+func TestStream_BranchValueDAGStreams(t *testing.T) {
+	build := func() *Graph[int, string] {
+		g := NewGraph[int, string]()
+		evenN, _ := AddLambdaNode(g, "even", func(_ context.Context, x int) (string, error) { return "even", nil })
+		oddN, _ := AddLambdaNode(g, "odd", func(_ context.Context, x int) (string, error) { return "odd", nil })
+		br, _ := AddBranch(g, "br", func(_ context.Context, x int) (string, error) {
+			if x%2 == 0 {
+				return "even", nil
+			}
+			return "odd", nil
+		}, map[string]NodeRef{"even": evenN, "odd": oddN})
+		exit, _ := AddPassthroughNode[int, string, string](g, "exit")
+		if err := g.AddEdge(evenN, exit); err != nil {
+			t.Fatalf("AddEdge even->exit: %v", err)
 		}
-		return "odd", nil
-	}, map[string]NodeRef{"even": evenN, "odd": oddN})
-	exit, _ := AddPassthroughNode[int, string, string](g, "exit")
-	if err := g.AddEdge(evenN, exit); err != nil {
-		t.Fatalf("AddEdge even->exit: %v", err)
-	}
-	if err := g.AddEdge(oddN, exit); err != nil {
-		t.Fatalf("AddEdge odd->exit: %v", err)
-	}
-	if err := g.Entry(br); err != nil {
-		t.Fatalf("Entry: %v", err)
-	}
-	if err := g.Exit(exit); err != nil {
-		t.Fatalf("Exit: %v", err)
+		if err := g.AddEdge(oddN, exit); err != nil {
+			t.Fatalf("AddEdge odd->exit: %v", err)
+		}
+		if err := g.Entry(br); err != nil {
+			t.Fatalf("Entry: %v", err)
+		}
+		if err := g.Exit(exit); err != nil {
+			t.Fatalf("Exit: %v", err)
+		}
+		return g
 	}
 
-	r, err := g.Compile(context.Background())
+	r, err := build().Compile(context.Background())
 	if err != nil {
 		t.Fatalf("Compile: %v", err)
 	}
-	if r.StreamCapable() {
-		t.Fatalf("graph with Branch must not be StreamCapable")
+	if !r.StreamCapable() {
+		t.Fatalf("value-only branch DAG must be StreamCapable")
 	}
 
-	sr, err := r.Stream(context.Background(), 4)
-	if err != nil {
-		t.Fatalf("Stream: %v", err)
-	}
-	defer sr.Close()
-	got, err := sr.Next()
-	if err != nil {
-		t.Fatalf("Next: %v", err)
-	}
-	if got != "even" {
-		t.Fatalf("degraded Next = %q, want %q (== Invoke)", got, "even")
-	}
-	if _, err := sr.Next(); err != io.EOF {
-		t.Fatalf("second Next = %v, want io.EOF", err)
+	for _, in := range []int{4, 7} {
+		sr, err := r.Stream(context.Background(), in)
+		if err != nil {
+			t.Fatalf("Stream(%d): %v", in, err)
+		}
+		got, err := sr.Next()
+		if err != nil {
+			t.Fatalf("Next(%d): %v", in, err)
+		}
+		if _, err := sr.Next(); err != io.EOF {
+			t.Fatalf("second Next(%d) = %v, want io.EOF", in, err)
+		}
+		sr.Close()
+
+		// Observable equivalence: Stream result == Invoke result.
+		want, err := r.Invoke(context.Background(), in)
+		if err != nil {
+			t.Fatalf("Invoke(%d): %v", in, err)
+		}
+		if got != want {
+			t.Fatalf("Stream(%d) = %q, want == Invoke %q", in, got, want)
+		}
 	}
 }
 
