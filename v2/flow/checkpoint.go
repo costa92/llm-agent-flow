@@ -45,6 +45,18 @@ type Checkpoint struct {
 	InterruptReq    InterruptRequest           `json:"interrupt_req"`
 	OriginalInputs  map[string]json.RawMessage `json:"original_inputs"`
 	CreatedAt       time.Time                  `json:"created_at"`
+
+	// State is the tagged-JSON-encoded committed graph State at the suspend
+	// point (POST per-layer reduce — see engine.go). Empty when the run had
+	// no State cell, or on v1/v2 checkpoints (back-compat: restore to empty).
+	// Encoded via the SAME tagged codec as port values (codec.go).
+	State json.RawMessage `json:"state,omitempty"`
+	// StateCodec is the resume guard for the State type S: the "state:"-
+	// namespaced codec tag combined with a structural fingerprint of S's
+	// shape (see statecodec.go). On resume, a mismatch against the resuming
+	// run's State type → ErrFlowChanged, defending against a same-tag/
+	// different-shape codec swap that would otherwise corrupt silently.
+	StateCodec string `json:"state_codec,omitempty"`
 }
 
 // clone returns a deep copy of cp's reference-type fields (Activated, the
@@ -87,6 +99,15 @@ func (cp Checkpoint) clone() Checkpoint {
 			oi[k] = raw
 		}
 		cp.OriginalInputs = oi
+	}
+	// State is treated immutable (like the PortValues RawMessages), but copy
+	// the slice bytes so a caller appending to a loaded State cannot reach a
+	// store's retained copy. A nil State stays nil. StateCodec is a string
+	// (copied by value with the rest of the struct).
+	if cp.State != nil {
+		st := make(json.RawMessage, len(cp.State))
+		copy(st, cp.State)
+		cp.State = st
 	}
 	return cp
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 )
 
 // RunResumable executes a fresh run that may suspend on a node interrupt.
@@ -39,10 +40,13 @@ func (e *Engine) Resume(ctx context.Context, runID, token string, humanInput map
 // ResumeWithState is Resume with optional graph State for the resumed
 // layers. With no options it is byte-identical to Resume.
 //
-// task 4: the actual restore of State from the checkpoint (Checkpoint.State
-// → seed the cell's committed value) wires in here once checkpoint State
-// snapshot/restore lands. For wave 1 the cell starts from the supplied
-// WithInitialState only — restored checkpoint State is NOT yet read.
+// When the checkpoint carries durable State (Checkpoint.State) AND the
+// caller supplies State opts, the restored State OVERRIDES the supplied
+// WithInitialState seed (durable State wins) and the State-type fingerprint
+// is guarded against the checkpoint's StateCodec (mismatch → ErrFlowChanged).
+// O3: if the caller supplies NO State opts but the checkpoint has State, the
+// restored State is dropped (seed-fresh) — no phantom cell is built. See
+// resumeWithCell.
 func (e *Engine) ResumeWithState(ctx context.Context, runID, token string, humanInput map[string]any, opts ...StateOption) (RunResult, error) {
 	return e.resumeWithCell(ctx, runID, token, humanInput, buildStateCell(opts))
 }
@@ -74,6 +78,41 @@ func (e *Engine) resumeWithCell(ctx context.Context, runID, token string, humanI
 	default:
 		// v1 checkpoint (no StructHash) or otherwise: strict full-hash compare.
 		return RunResult{}, ErrFlowChanged
+	}
+
+	// State restore + type-change guard. Only when the resume supplies a cell
+	// (State opts). O3: a State-less resume (cell==nil) of a State-bearing
+	// checkpoint silently drops the restored State (seed-fresh) — we do NOT
+	// fabricate a phantom cell.
+	if cell != nil && len(cp.State) > 0 {
+		// MAJOR-4 guard: the resume run's State fingerprint must match the
+		// checkpoint's. The cell's committed value carries the resume run's S
+		// (from WithInitialState); compare its fingerprint to cp.StateCodec.
+		// A different tag (different S) or a same-tag/different-shape S both
+		// surface here as a mismatch → ErrFlowChanged, before we Unmarshal
+		// into a mismatched shape (which would corrupt silently). For the
+		// pure-engine route S is a run option, so tag stability across a
+		// shape change is the caller's responsibility; the fingerprint still
+		// catches the same-tag/different-shape case.
+		if cp.StateCodec != "" {
+			seed := cell.snapshot()
+			if seed != nil {
+				tag, terr := stateCodecTag(reflect.TypeOf(seed))
+				if terr != nil {
+					return RunResult{}, fmt.Errorf("flow: resume: state: %w", terr)
+				}
+				if tag != cp.StateCodec {
+					return RunResult{}, ErrFlowChanged
+				}
+			}
+		}
+		// Decode the durable State and override the cell's committed seed —
+		// durable State wins over WithInitialState.
+		restored, derr := decodePortValue(cp.State)
+		if derr != nil {
+			return RunResult{}, fmt.Errorf("flow: resume: state: %w", derr)
+		}
+		cell.setCommitted(restored)
 	}
 
 	// Restore activated cursor.

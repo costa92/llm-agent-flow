@@ -41,6 +41,16 @@ func newStateCell(initial any, reducer func(prev any, writes []any) (any, error)
 	}
 }
 
+// setCommitted overrides the committed State, used on resume to restore the
+// durable State decoded from a checkpoint (durable State wins over any
+// WithInitialState seed). It runs on the single engine goroutine before any
+// node goroutine is live, so the lock is for consistency, not contention.
+func (c *stateCell) setCommitted(s any) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.committed = s
+}
+
 // stage records nodeID's State write, overwriting any prior write from the
 // same node (last-write-per-node).
 func (c *stateCell) stage(nodeID string, s any) {

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"reflect"
 	"sync"
 	"time"
 
@@ -542,7 +543,7 @@ func (e *Engine) runCore(ctx context.Context, inputs map[string]any, ch chan<- E
 					emit(Event{Kind: FlowErr, Err: err})
 					return nil, nil, err // sibling cond eval error → no checkpoint
 				}
-				cp, err := e.snapshotCheckpoint(runID, layerIdx, pend[0], activated, portValues, edgeStates, inputs)
+				cp, err := e.snapshotCheckpoint(runID, layerIdx, pend[0], activated, portValues, edgeStates, inputs, cell)
 				if err != nil {
 					emit(Event{Kind: FlowErr, Err: err})
 					return nil, nil, err // e.g. ErrNotCheckpointable
@@ -595,9 +596,17 @@ func (e *Engine) runCore(ctx context.Context, inputs map[string]any, ch chan<- E
 // snapshotCheckpoint builds a serializable Checkpoint from the live run
 // state at a suspend point. It runs AFTER the layer's fanout has joined,
 // so no node goroutines are live — a plain read of portValues is safe.
+//
+// cell (nil when State is unused) carries the graph State. Because this runs
+// after the per-layer barrier reduce (engine.go: cell.reduce() at the layer
+// loop, before this suspend splice) and before snapshotting, cell.committed
+// is the POST-reduce State of the suspend layer — exactly the State a resume
+// must restore. NOTE: an interrupt node returns (nil,nil) out of Run on its
+// suspending leg, so it CANNOT stage a State write there; State+HITL authors
+// must write State in a non-interrupting node.
 func (e *Engine) snapshotCheckpoint(runID string, layerIdx int, pend pendingInterrupt,
 	activated map[string]bool, portValues map[string]map[string]any,
-	edgeStates []EdgeFireState, inputs map[string]any) (Checkpoint, error) {
+	edgeStates []EdgeFireState, inputs map[string]any, cell *stateCell) (Checkpoint, error) {
 
 	pv := make(map[string]map[string]json.RawMessage, len(portValues))
 	for nodeID, ports := range portValues {
@@ -631,8 +640,31 @@ func (e *Engine) snapshotCheckpoint(runID string, layerIdx int, pend pendingInte
 		}
 	}
 
+	// State: encode the POST-reduce committed State (cell.committed) via the
+	// same tagged codec as ports, and record the namespaced/fingerprinted
+	// StateCodec guard. A non-nil committed value with no registered codec is
+	// an error wrapping ErrNotCheckpointable (mirrors port behavior) — a
+	// State-bearing run is checkpointable only if RegisterCodec[S] was called.
+	var stateRaw json.RawMessage
+	var stateCodec string
+	if cell != nil {
+		committed := cell.snapshot()
+		if committed != nil {
+			raw, err := encodePortValue(committed)
+			if err != nil {
+				return Checkpoint{}, fmt.Errorf("flow: checkpoint: state: %w", err)
+			}
+			tag, err := stateCodecTag(reflect.TypeOf(committed))
+			if err != nil {
+				return Checkpoint{}, fmt.Errorf("flow: checkpoint: state: %w", err)
+			}
+			stateRaw = raw
+			stateCodec = tag
+		}
+	}
+
 	return Checkpoint{
-		Version:         2,
+		Version:         3,
 		RunID:           runID,
 		FlowID:          e.flow.ID,
 		FlowHash:        e.flowHash,
@@ -645,6 +677,8 @@ func (e *Engine) snapshotCheckpoint(runID string, layerIdx int, pend pendingInte
 		InterruptReq:    pend.req,
 		OriginalInputs:  origInputs,
 		CreatedAt:       time.Now(),
+		State:           stateRaw,
+		StateCodec:      stateCodec,
 	}, nil
 }
 
