@@ -24,6 +24,14 @@ import (
 // source/target node+port, and the condition string. Edges keep slice order
 // because the resume cursor (Checkpoint.EdgeStates) is indexed by position,
 // so any add/remove/reorder of edges must change the hash.
+//
+// MAJOR-4(b): the graph State type S is intentionally NOT folded into this
+// hash. On the only checkpointable path (the pure-engine route) S is a RUN
+// option, not build-known, so it isn't available here; and the typed
+// AddStatefulLambdaNode route is non-serializable (holds a Go closure) → never
+// checkpointed, so folding S there would be dead protection. The State-type
+// guard lives entirely in Checkpoint.StateCodec (the namespaced tag +
+// shape fingerprint, compared on resume — see statecodec.go / resume.go).
 func structuralHash(f Flow, nodes map[string]NodeKind) (string, error) {
 	type portDesc = string // just the port name
 
