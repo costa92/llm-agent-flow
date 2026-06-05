@@ -84,9 +84,9 @@ func TestBranch_RoutesAndSkips(t *testing.T) {
 // IDs that emitted a NodeSkipped event.
 func streamSkipped(t *testing.T, r *Runnable[int, string], in int) map[string]bool {
 	t.Helper()
-	ch, err := r.Stream(context.Background(), in)
+	ch, err := r.Events(context.Background(), in)
 	if err != nil {
-		t.Fatalf("Stream: %v", err)
+		t.Fatalf("Events: %v", err)
 	}
 	skipped := make(map[string]bool)
 	for ev := range ch {
