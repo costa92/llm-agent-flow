@@ -171,11 +171,13 @@ func AddParallel[GI, GO, In any](g *Graph[GI, GO], id string, branches map[strin
 func AddPassthroughNode[GI, GO, T any](g *Graph[GI, GO], id string) (NodeRef, error)
 func AddTemplateNode[GI, GO any](g *Graph[GI, GO], id string, t prompt.Requester) (NodeRef, error)
 func AddToolNode[GI, GO any](g *Graph[GI, GO], id string, t agents.Tool) (NodeRef, error)
+func Copy[T any](src StreamReader[T], n int) []StreamReader[T]
 method (*Graph[I, O]) AddEdge(from, to NodeRef) error
 method (*Graph[I, O]) AddEdgeTo(from, to NodeRef, toPort string) error
 method (*Graph[I, O]) Compile(_ context.Context, opts ...flow.EngineOption) (*Runnable[I, O], error)
 method (*Graph[I, O]) Entry(to NodeRef) error
 method (*Graph[I, O]) Exit(from NodeRef) error
+func Merge[T any](srcs ...StreamReader[T]) StreamReader[T]
 func NewBuiltinRegistry() *flow.NodeRegistry
 func NewGraph[I, O any]() *Graph[I, O]
 func RegisterConcatenator[T, R any](fn Concatenator[T])
