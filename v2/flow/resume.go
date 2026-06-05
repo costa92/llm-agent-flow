@@ -18,11 +18,36 @@ func (e *Engine) RunResumable(ctx context.Context, runID string, inputs map[stri
 	return RunResult{Outputs: out, Suspended: susp}, nil
 }
 
+// RunResumableWithState is RunResumable with optional graph State. With no
+// options it is byte-identical to RunResumable (no cell, helpers inert).
+func (e *Engine) RunResumableWithState(ctx context.Context, runID string, inputs map[string]any, opts ...StateOption) (RunResult, error) {
+	out, susp, err := e.runCore(ctx, inputs, nil, runID, true, nil, buildStateCell(opts))
+	if err != nil {
+		return RunResult{}, err
+	}
+	return RunResult{Outputs: out, Suspended: susp}, nil
+}
+
 // Resume continues a suspended run identified by token, injecting
 // humanInput as the interrupt node's output ports, firing the deferred
 // out-edges of the interrupt node, then resuming the layer loop from the
 // layer after the suspend point.
 func (e *Engine) Resume(ctx context.Context, runID, token string, humanInput map[string]any) (RunResult, error) {
+	return e.resumeWithCell(ctx, runID, token, humanInput, nil)
+}
+
+// ResumeWithState is Resume with optional graph State for the resumed
+// layers. With no options it is byte-identical to Resume.
+//
+// task 4: the actual restore of State from the checkpoint (Checkpoint.State
+// → seed the cell's committed value) wires in here once checkpoint State
+// snapshot/restore lands. For wave 1 the cell starts from the supplied
+// WithInitialState only — restored checkpoint State is NOT yet read.
+func (e *Engine) ResumeWithState(ctx context.Context, runID, token string, humanInput map[string]any, opts ...StateOption) (RunResult, error) {
+	return e.resumeWithCell(ctx, runID, token, humanInput, buildStateCell(opts))
+}
+
+func (e *Engine) resumeWithCell(ctx context.Context, runID, token string, humanInput map[string]any, cell *stateCell) (RunResult, error) {
 	if e.checkpointStore == nil {
 		return RunResult{}, ErrNoCheckpointStore
 	}
@@ -139,7 +164,7 @@ func (e *Engine) Resume(ctx context.Context, runID, token string, humanInput map
 		portValues: portValues,
 		edgeStates: edgeStates,
 		startLayer: cp.SuspendLayer + 1,
-	}, nil)
+	}, cell)
 	if err != nil {
 		return RunResult{}, err
 	}

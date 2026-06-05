@@ -25,11 +25,14 @@ func Compile(f Flow, reg *NodeRegistry, deps Deps, opts ...EngineOption) (*Engin
 method (*Engine) FlowID() string
 method (*Engine) FlowName() string
 method (*Engine) Resume(ctx context.Context, runID, token string, humanInput map[string]any) (RunResult, error)
+method (*Engine) ResumeWithState(ctx context.Context, runID, token string, humanInput map[string]any, opts ...StateOption) (RunResult, error)
 method (*Engine) Run(ctx context.Context, inputs map[string]any) (map[string]any, error)
 method (*Engine) RunResumable(ctx context.Context, runID string, inputs map[string]any) (RunResult, error)
+method (*Engine) RunResumableWithState(ctx context.Context, runID string, inputs map[string]any, opts ...StateOption) (RunResult, error)
 method (*Engine) RunStream(ctx context.Context, inputs map[string]any) (<-chan Event, error)
 method (*Engine) RunStreamString(ctx context.Context, inputs map[string]string) (<-chan Event, error)
 method (*Engine) RunString(ctx context.Context, inputs map[string]string) (map[string]string, error)
+method (*Engine) RunWithState(ctx context.Context, inputs map[string]any, opts ...StateOption) (map[string]any, error)
 func Interrupt(req InterruptRequest) error
 method (*InterruptError) Error() string
 func Load(r io.Reader) (Flow, error)
@@ -45,11 +48,15 @@ func NewRunID() string
 method (*NodeRegistry) Build(n Node, deps Deps) (NodeKind, error)
 method (*NodeRegistry) Register(typ string, fac NodeFactory) error
 func RegisterCodec[T any](name string)
+func SetState[S any](ctx context.Context, s S)
+func StateFromContext[S any](ctx context.Context) (S, bool)
 func Validate(f Flow) error
 method (*ValidateError) Error() string
 func WithCheckpointStore(cs CheckpointStore) EngineOption
 func WithConditionEvaluator(e ConditionEvaluator) EngineOption
+func WithInitialState[S any](s S) StateOption
 func WithMaxNodeConcurrency(n int) EngineOption
+func WithReducer[S any](fn func(prev S, writes []S) S) StateOption
 type Checkpoint struct
 	field Activated map[string]bool
 	field CreatedAt time.Time
@@ -148,6 +155,7 @@ type RunResult struct
 type Runner interface
 	method Run(ctx context.Context, inputs map[string]any) (map[string]any, error)
 	method RunStream(ctx context.Context, inputs map[string]any) (<-chan Event, error)
+type StateOption func(*stateConfig)
 type Suspension struct
 	field NodeID string
 	field Request InterruptRequest
@@ -161,6 +169,7 @@ var ErrInvalidHumanInput = errors.New("flow: resume: humanInput key not a declar
 var ErrMultipleInterrupts = errors.New("flow: multiple pending interrupts in one layer")
 var ErrNoCheckpointStore = errors.New("flow: interrupt requested but no CheckpointStore configured")
 var ErrNotCheckpointable = errors.New("flow: graph not checkpointable (non-serializable port or in-flight stream)")
+var ErrStateWriteConflict = errors.New("flow: state: two nodes wrote State in one layer with no WithReducer")
 var ErrUninstrumentedInterrupt = errors.New("flow: node returned InterruptError but is not InterruptCapable")
 package github.com/costa92/llm-agent-flow/v2/flow/graph
 func AddBranch[GI, GO, T any](g *Graph[GI, GO], id string, key func(context.Context, T) (string, error), routes map[string]NodeRef) (NodeRef, error)

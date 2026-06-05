@@ -226,6 +226,15 @@ func (e *Engine) Run(ctx context.Context, inputs map[string]any) (map[string]any
 	return out, err
 }
 
+// RunWithState is Run with optional graph State. Pass WithInitialState
+// and/or WithReducer to make State available to nodes via StateFromContext
+// / SetState. With no options it is byte-identical to Run (no cell, helpers
+// inert).
+func (e *Engine) RunWithState(ctx context.Context, inputs map[string]any, opts ...StateOption) (map[string]any, error) {
+	out, _, err := e.runCore(ctx, inputs, nil, "", false, nil, buildStateCell(opts))
+	return out, err
+}
+
 // RunStream executes the flow asynchronously and emits Events describing
 // each node's lifecycle. The returned channel is closed after the
 // terminal event (FlowDone or FlowErr).
