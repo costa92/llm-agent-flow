@@ -1,0 +1,199 @@
+# llm-agent-flow/v2 v2.0 exported API snapshot — generated, do not hand-edit.
+package github.com/costa92/llm-agent-flow/v2/examples/hitl
+method (*Flow) Resume(ctx context.Context, runID, token, decision string) (map[string]any, error)
+method (*Flow) Start(ctx context.Context) (runID string, susp *flow.Suspension, err error)
+func New() (*Flow, error)
+type Flow struct
+package github.com/costa92/llm-agent-flow/v2/examples/typed_graph
+func Run(ctx context.Context) (string, error)
+package github.com/costa92/llm-agent-flow/v2/flow
+const EdgeDeadFalse
+const EdgeDeadNoPort
+const EdgeDeadSrcSkip
+const EdgeDeferred
+const EdgeFired
+const EdgePending EdgeFireState = iota
+const FlowDone
+const FlowErr
+const FlowStarted EventKind = iota
+const FlowSuspended
+const NodeFinished
+const NodeInterrupted
+const NodeSkipped
+const NodeStarted
+func Compile(f Flow, reg *NodeRegistry, deps Deps, opts ...EngineOption) (*Engine, error)
+method (*Engine) FlowID() string
+method (*Engine) FlowName() string
+method (*Engine) Resume(ctx context.Context, runID, token string, humanInput map[string]any) (RunResult, error)
+method (*Engine) Run(ctx context.Context, inputs map[string]any) (map[string]any, error)
+method (*Engine) RunResumable(ctx context.Context, runID string, inputs map[string]any) (RunResult, error)
+method (*Engine) RunStream(ctx context.Context, inputs map[string]any) (<-chan Event, error)
+method (*Engine) RunStreamString(ctx context.Context, inputs map[string]string) (<-chan Event, error)
+method (*Engine) RunString(ctx context.Context, inputs map[string]string) (map[string]string, error)
+func Interrupt(req InterruptRequest) error
+method (*InterruptError) Error() string
+func Load(r io.Reader) (Flow, error)
+func LoadCompile(r io.Reader, reg *NodeRegistry, deps Deps, opts ...EngineOption) (*Engine, error)
+func Marshal(f Flow) ([]byte, error)
+method (*MemoryCheckpointStore) DeleteCheckpoint(ctx context.Context, token string) error
+method (*MemoryCheckpointStore) ListCheckpoints(ctx context.Context, flowID string, limit int) ([]CheckpointMeta, error)
+method (*MemoryCheckpointStore) LoadCheckpoint(ctx context.Context, token string) (Checkpoint, error)
+method (*MemoryCheckpointStore) SaveCheckpoint(ctx context.Context, cp Checkpoint) error
+func NewMemoryCheckpointStore() *MemoryCheckpointStore
+func NewNodeRegistry() *NodeRegistry
+func NewRunID() string
+method (*NodeRegistry) Build(n Node, deps Deps) (NodeKind, error)
+method (*NodeRegistry) Register(typ string, fac NodeFactory) error
+func RegisterCodec[T any](name string)
+func Validate(f Flow) error
+method (*ValidateError) Error() string
+func WithCheckpointStore(cs CheckpointStore) EngineOption
+func WithConditionEvaluator(e ConditionEvaluator) EngineOption
+func WithMaxNodeConcurrency(n int) EngineOption
+type Checkpoint struct
+	field Activated map[string]bool
+	field CreatedAt time.Time
+	field EdgeStates []EdgeFireState
+	field FlowHash string
+	field FlowID string
+	field InterruptNodeID string
+	field InterruptReq InterruptRequest
+	field OriginalInputs map[string]json.RawMessage
+	field PortValues map[string]map[string]json.RawMessage
+	field RunID string
+	field SuspendLayer int
+	field Version int
+type CheckpointMeta struct
+	field CreatedAt time.Time
+	field FlowID string
+	field InterruptNodeID string
+	field RunID string
+type CheckpointStore interface
+	method DeleteCheckpoint(ctx context.Context, token string) error
+	method ListCheckpoints(ctx context.Context, flowID string, limit int) ([]CheckpointMeta, error)
+	method LoadCheckpoint(ctx context.Context, token string) (Checkpoint, error)
+	method SaveCheckpoint(ctx context.Context, cp Checkpoint) error
+type CondEnv struct
+	field Value string
+type Condition interface
+	method Evaluate(ctx context.Context, env CondEnv) (bool, error)
+type ConditionEvaluator interface
+	method Compile(expr string) (Condition, error)
+type Deps struct
+type Edge struct
+	field Condition string
+	field Source PortRef
+	field Target PortRef
+type EdgeFireState uint8
+type Engine struct
+type EngineOption func(*engineConfig)
+type Event struct
+	field Err error
+	field FlowID string
+	field Input map[string]any
+	field Kind EventKind
+	field Metadata map[string]string
+	field NodeID string
+	field Output map[string]any
+	field Outputs map[string]any
+	field Request *InterruptRequest
+	field ResumeToken string
+type EventKind uint8
+type Flow struct
+	field Description string
+	field Edges []Edge
+	field ID string
+	field Inputs []NamedPortRef
+	field Name string
+	field Nodes []Node
+	field Outputs []NamedPortRef
+type InterruptCapable interface
+	embed NodeKind
+	method CanInterrupt() bool
+type InterruptError struct
+	field Request InterruptRequest
+type InterruptRequest struct
+	field Kind string
+	field Prompt string
+	field Schema json.RawMessage
+type MemoryCheckpointStore struct
+type NamedPortRef struct
+	field Name string
+	field PortRef
+type Node struct
+	field Config json.RawMessage
+	field ID string
+	field Type string
+type NodeFactory func(cfg json.RawMessage, deps Deps) (NodeKind, error)
+type NodeKind interface
+	method Inputs() []Port
+	method Outputs() []Port
+	method Run(ctx context.Context, in map[string]any) (map[string]any, error)
+type NodeRegistry struct
+type Port struct
+	field GoType reflect.Type
+	field Name string
+	field Schema string
+type PortRef struct
+	field Node string
+	field Port string
+type ResumableRunner interface
+	embed Runner
+	method Resume(ctx context.Context, runID, token string, humanInput map[string]any) (RunResult, error)
+	method RunResumable(ctx context.Context, runID string, inputs map[string]any) (RunResult, error)
+type RunResult struct
+	field Outputs map[string]any
+	field Suspended *Suspension
+type Runner interface
+	method Run(ctx context.Context, inputs map[string]any) (map[string]any, error)
+	method RunStream(ctx context.Context, inputs map[string]any) (<-chan Event, error)
+type Suspension struct
+	field NodeID string
+	field Request InterruptRequest
+	field ResumeToken string
+type ValidateError struct
+	field Issues []string
+var ErrCheckpointNotFound = errors.New("flow: resume: checkpoint not found")
+var ErrEmptyFlow = errors.New("flow: validate: no nodes")
+var ErrFlowChanged = errors.New("flow: resume: flow definition changed since checkpoint")
+var ErrInvalidHumanInput = errors.New("flow: resume: humanInput key not a declared output port of the interrupt node")
+var ErrMultipleInterrupts = errors.New("flow: multiple pending interrupts in one layer")
+var ErrNoCheckpointStore = errors.New("flow: interrupt requested but no CheckpointStore configured")
+var ErrNotCheckpointable = errors.New("flow: graph not checkpointable (non-serializable port or in-flight stream)")
+var ErrUninstrumentedInterrupt = errors.New("flow: node returned InterruptError but is not InterruptCapable")
+package github.com/costa92/llm-agent-flow/v2/flow/graph
+func AddBranch[GI, GO, T any](g *Graph[GI, GO], id string, key func(context.Context, T) (string, error), routes map[string]NodeRef) (NodeRef, error)
+func AddChatModelNode[GI, GO any](g *Graph[GI, GO], id string, m llm.ChatModel) (NodeRef, error)
+func AddLambdaNode[GI, GO, In, Out any](g *Graph[GI, GO], id string, fn func(context.Context, In) (Out, error)) (NodeRef, error)
+func AddPassthroughNode[GI, GO, T any](g *Graph[GI, GO], id string) (NodeRef, error)
+func AddTemplateNode[GI, GO any](g *Graph[GI, GO], id string, t prompt.Requester) (NodeRef, error)
+func AddToolNode[GI, GO any](g *Graph[GI, GO], id string, t agents.Tool) (NodeRef, error)
+method (*Graph[I, O]) AddEdge(from, to NodeRef) error
+method (*Graph[I, O]) Compile(_ context.Context, opts ...flow.EngineOption) (*Runnable[I, O], error)
+method (*Graph[I, O]) Entry(to NodeRef) error
+method (*Graph[I, O]) Exit(from NodeRef) error
+func NewBuiltinRegistry() *flow.NodeRegistry
+func NewGraph[I, O any]() *Graph[I, O]
+func RegisterConcatenator[T, R any](fn Concatenator[T])
+method (*Runnable[I, O]) Checkpointable() bool
+method (*Runnable[I, O]) Events(ctx context.Context, in I) (<-chan flow.Event, error)
+method (*Runnable[I, O]) Invoke(ctx context.Context, in I) (O, error)
+method (*Runnable[I, O]) Lower() (flow.Flow, error)
+method (*Runnable[I, O]) Serializable() bool
+method (*Runnable[I, O]) Stream(ctx context.Context, in I) (StreamReader[O], error)
+method (*Runnable[I, O]) StreamCapable() bool
+type Concatenator<unprintable> func(StreamReader[T]) (any, error)
+type Graph<unprintable> struct
+type NodeRef struct
+type Runnable<unprintable> struct
+type StreamReader<unprintable> interface
+	method Close() error
+	method Next() (T, error)
+package github.com/costa92/llm-agent-flow/v2/flow/store/sqlite
+func Open(dsn string) (*Store, error)
+method (*Store) Close() error
+method (*Store) DeleteCheckpoint(ctx context.Context, token string) error
+method (*Store) ListCheckpoints(ctx context.Context, flowID string, limit int) ([]flow.CheckpointMeta, error)
+method (*Store) LoadCheckpoint(ctx context.Context, token string) (flow.Checkpoint, error)
+method (*Store) SaveCheckpoint(ctx context.Context, cp flow.Checkpoint) error
+type Store struct
