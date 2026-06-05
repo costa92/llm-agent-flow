@@ -126,17 +126,38 @@ func RegisterConcatenator[T, R any](fn Concatenator[T]) {
 
 // lookupConcat returns the folder for downstream target type targetT.
 //
-// Known limitation: lookup is EXACT-type-only. A stream edge / output whose
-// downstream type is an INTERFACE that the produced concrete type merely
-// implements has no registered folder under that interface type, so Stream
-// is more restrictive than Invoke here: such graphs Compile fine for Invoke
-// but error under Stream ("no Concatenator for <iface>"). An assignability
-// scan over registered folders is deferred to Phase 2.
+// Selection order: (1) an exact registration for targetT (the fast,
+// deterministic, preferred path); (2) failing that, a folder whose produced
+// type is assignable to targetT — i.e. targetT is an interface the produced
+// concrete type implements (the §1.B rule-2 check, the same one Invoke
+// applies to an edge). The fallback keeps Stream from being more restrictive
+// than Invoke for interface-typed stream edges/outputs.
+//
+// Ambiguity is failed loud, never guessed: if more than one registered folder
+// is assignable to targetT and none is exact, lookup returns (nil, false) so
+// the caller reports "no Concatenator" rather than silently picking one
+// interface-satisfying folder over another.
 func lookupConcat(targetT reflect.Type) (func(StreamReader[any]) (any, error), bool) {
 	concatRegistryMu.RLock()
 	defer concatRegistryMu.RUnlock()
-	fn, ok := concatRegistry[targetT]
-	return fn, ok
+	if fn, ok := concatRegistry[targetT]; ok {
+		return fn, true
+	}
+	var only func(StreamReader[any]) (any, error)
+	matches := 0
+	for k, fn := range concatRegistry {
+		if ok, deferred := assignable(k, targetT); ok && !deferred {
+			only = fn
+			matches++
+			if matches > 1 {
+				return nil, false // ambiguous — fail loud
+			}
+		}
+	}
+	if matches == 1 {
+		return only, true
+	}
+	return nil, false
 }
 
 // adaptStream re-types a StreamReader[any] to a StreamReader[T] by
