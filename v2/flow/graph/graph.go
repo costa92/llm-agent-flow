@@ -163,6 +163,44 @@ func AddLambdaNode[GI, GO, In, Out any](g *Graph[GI, GO], id string, fn func(con
 	return ref, nil
 }
 
+// AddInterruptibleLambdaNode is AddLambdaNode for a node that may request a
+// human interrupt: its fn may return flow.Interrupt(req), and the adapter
+// declares flow.InterruptCapable (CanInterrupt()==true) so a checkpoint-
+// enabled engine honors the suspend instead of failing with
+// ErrUninstrumentedInterrupt. (An ordinary AddLambdaNode that interrupts is
+// rejected — interrupt capability must be declared.)
+//
+// Caveat: like any lambda node it holds a Go closure, so the graph is
+// non-serializable (Checkpointable()==false). A suspend therefore snapshots
+// the live port values via the codec registry; if a port value's type has no
+// registered codec the suspend fails with ErrNotCheckpointable. Register
+// codecs (flow.RegisterCodec[T]) for the node's port types, or author the
+// HITL flow on the serializable JSON route, for a durable checkpoint.
+func AddInterruptibleLambdaNode[GI, GO, In, Out any](g *Graph[GI, GO], id string, fn func(context.Context, In) (Out, error)) (NodeRef, error) {
+	inT := reflect.TypeFor[In]()
+	outT := reflect.TypeFor[Out]()
+	newKind := func() flow.NodeKind {
+		return &interruptibleLambdaAdapter[In, Out]{
+			lambdaAdapter: lambdaAdapter[In, Out]{id: id, fn: fn, inT: inT, outT: outT},
+		}
+	}
+	ref, err := g.addNode(id, inT, outT, newKind)
+	if err != nil {
+		return NodeRef{}, err
+	}
+	g.markInProcess(id, "interruptible lambda node holds a Go closure (in-process only)")
+	return ref, nil
+}
+
+// interruptibleLambdaAdapter is a lambdaAdapter that additionally declares
+// flow.InterruptCapable. Inputs/Outputs/Run are inherited from the embedded
+// lambdaAdapter; only the capability marker is added.
+type interruptibleLambdaAdapter[In, Out any] struct {
+	lambdaAdapter[In, Out]
+}
+
+func (a *interruptibleLambdaAdapter[In, Out]) CanInterrupt() bool { return true }
+
 // AddPassthroughNode adds an identity node carrying a value of type T from
 // its in port to its out port unchanged. Unlike Lambda it is serializable
 // (builtin.passthrough): it holds no Go closure, so it round-trips through
