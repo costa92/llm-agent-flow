@@ -201,6 +201,61 @@ type interruptibleLambdaAdapter[In, Out any] struct {
 
 func (a *interruptibleLambdaAdapter[In, Out]) CanInterrupt() bool { return true }
 
+// AddStatefulLambdaNode adds a program-only closure node that additionally
+// reads and writes graph State. The adapter's Run pulls in["in"], reads the
+// current State via flow.StateFromContext[S] (zero,false if the run supplied
+// no State opts → State-less Invoke behaves inertly), calls fn(ctx, in,
+// state), and emits {"out": Out}. fn may call flow.SetState(ctx, newState) to
+// stage a write applied at the layer barrier.
+//
+// Like AddLambdaNode it holds a Go closure (markInProcess), so the graph is
+// non-serializable and this route's State is RUNTIME-ONLY, NOT durable:
+// checkpoint State is exercised only on the engine/JSON route (task 4). Drive
+// it with the State-aware Runnable.InvokeWithState entry.
+func AddStatefulLambdaNode[GI, GO, In, Out, S any](g *Graph[GI, GO], id string, fn func(ctx context.Context, in In, state S) (Out, error)) (NodeRef, error) {
+	inT := reflect.TypeFor[In]()
+	outT := reflect.TypeFor[Out]()
+	newKind := func() flow.NodeKind {
+		return &statefulLambdaAdapter[In, Out, S]{
+			lambdaAdapter: lambdaAdapter[In, Out]{id: id, inT: inT, outT: outT},
+			fn:            fn,
+		}
+	}
+	ref, err := g.addNode(id, inT, outT, newKind)
+	if err != nil {
+		return NodeRef{}, err
+	}
+	g.markInProcess(id, "stateful lambda node holds a Go closure (in-process only)")
+	return ref, nil
+}
+
+// statefulLambdaAdapter is the flow.NodeKind for a stateful closure node. It
+// reuses lambdaAdapter's Inputs/Outputs (single in/out port) but overrides Run
+// to thread the current State into fn. fn may SetState to stage a write.
+type statefulLambdaAdapter[In, Out, S any] struct {
+	lambdaAdapter[In, Out]
+	fn func(ctx context.Context, in In, state S) (Out, error)
+}
+
+func (a *statefulLambdaAdapter[In, Out, S]) Run(ctx context.Context, in map[string]any) (map[string]any, error) {
+	raw, ok := in[portIn]
+	if !ok {
+		return nil, fmt.Errorf("graph: node %q: missing input port %q", a.id, portIn)
+	}
+	typed, ok := raw.(In)
+	if !ok {
+		return nil, fmt.Errorf("graph: node %q: input is %T, not assignable to %s", a.id, raw, a.inT)
+	}
+	// State-less run → (zero, false); fn sees the zero State and any SetState
+	// no-ops (the helpers are inert without a cell).
+	state, _ := flow.StateFromContext[S](ctx)
+	out, err := a.fn(ctx, typed, state)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{portOut: out}, nil
+}
+
 // AddPassthroughNode adds an identity node carrying a value of type T from
 // its in port to its out port unchanged. Unlike Lambda it is serializable
 // (builtin.passthrough): it holds no Go closure, so it round-trips through

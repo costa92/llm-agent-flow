@@ -335,6 +335,29 @@ func (r *Runnable[I, O]) Invoke(ctx context.Context, in I) (O, error) {
 	return typed, nil
 }
 
+// InvokeWithState runs the compiled graph with graph State enabled, threading
+// the StateOptions (flow.WithInitialState / flow.WithReducer) into the
+// engine's RunWithState so stateful nodes (AddStatefulLambdaNode) can read and
+// write State. With no options it is equivalent to Invoke (no cell, helpers
+// inert). State on this route is runtime-only — the typed front-end is
+// non-serializable, so it is NOT checkpointed (see AddStatefulLambdaNode).
+func (r *Runnable[I, O]) InvokeWithState(ctx context.Context, in I, opts ...flow.StateOption) (O, error) {
+	var zero O
+	out, err := r.engine.RunWithState(ctx, map[string]any{graphInputKey: in}, opts...)
+	if err != nil {
+		return zero, err
+	}
+	raw, ok := out[graphOutputKey]
+	if !ok {
+		return zero, fmt.Errorf("graph: invoke: engine produced no output %q", graphOutputKey)
+	}
+	typed, ok := raw.(O)
+	if !ok {
+		return zero, fmt.Errorf("graph: invoke: output is %T, not assignable to %s", raw, r.outT)
+	}
+	return typed, nil
+}
+
 // Events runs the compiled graph and returns the engine's LIFECYCLE event
 // channel, boxing in into the engine input port. The channel is closed
 // after the terminal event. The graph output is delivered via the
