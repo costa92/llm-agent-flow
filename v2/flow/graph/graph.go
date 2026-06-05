@@ -29,10 +29,15 @@ const (
 // NodeRef is an opaque handle to a node added to a Graph. It carries the
 // node's id and its declared Go input/output types so AddEdge/Entry/Exit
 // can run reflect-based assignability checks at build time.
+//
+// inPorts is non-nil ONLY for multi-input nodes (fan-in combiners): it maps
+// each declared input-port name to its Go type. Single-port nodes leave
+// inPorts nil and continue to use inT with the implicit portIn name.
 type NodeRef struct {
-	id   string
-	inT  reflect.Type
-	outT reflect.Type
+	id      string
+	inT     reflect.Type
+	outT    reflect.Type
+	inPorts map[string]reflect.Type
 }
 
 // graphNode is the internal record of one typed node: its id plus a

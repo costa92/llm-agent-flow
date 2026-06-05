@@ -57,6 +57,36 @@ func (g *Graph[I, O]) AddEdge(from, to NodeRef) error {
 	return nil
 }
 
+// AddEdgeTo connects from.out to a NAMED input port of to. It is the
+// multi-input-port counterpart of AddEdge: for a fan-in combiner (to.inPorts
+// non-nil) it resolves the target port's declared type from to.inPorts;
+// for a single-port node it requires toPort == portIn and uses to.inT. The
+// from.outT -> port-type assignability is checked at build time, latched on
+// mismatch like AddEdge.
+func (g *Graph[I, O]) AddEdgeTo(from, to NodeRef, toPort string) error {
+	var portType reflect.Type
+	if to.inPorts != nil {
+		pt, ok := to.inPorts[toPort]
+		if !ok {
+			return g.latch(fmt.Errorf("graph: edge %q.%s -> %q.%s: %q is not a declared input port",
+				from.id, portOut, to.id, toPort, toPort))
+		}
+		portType = pt
+	} else {
+		if toPort != portIn {
+			return g.latch(fmt.Errorf("graph: edge %q.%s -> %q.%s: single-port node only accepts port %q",
+				from.id, portOut, to.id, toPort, portIn))
+		}
+		portType = to.inT
+	}
+	if ok, _ := assignable(from.outT, portType); !ok {
+		return g.latch(fmt.Errorf("graph: edge %q.%s -> %q.%s: %s not assignable to %s",
+			from.id, portOut, to.id, toPort, from.outT, portType))
+	}
+	g.edges = append(g.edges, graphEdge{from: from.id, to: to.id, fromPort: portOut, toPort: toPort})
+	return nil
+}
+
 // Entry marks to as the graph's input node: the graph input I is boxed
 // into to's in port at Invoke. Checks I is assignable to to.inT.
 func (g *Graph[I, O]) Entry(to NodeRef) error {

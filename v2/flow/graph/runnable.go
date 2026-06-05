@@ -101,9 +101,16 @@ func (g *Graph[I, O]) Compile(_ context.Context, opts ...flow.EngineOption) (*Ru
 	// so the invariant holds regardless.)
 	for _, e := range g.edges {
 		from, to := g.byID[e.from], g.byID[e.to]
-		if ok, _ := assignable(from.outT, to.inT); !ok {
+		// Resolve the target port's declared type: a multi-input combiner
+		// (to.inPorts != nil) keys on the edge's toPort; a single-port node
+		// uses inT.
+		toType := to.inT
+		if to.inPorts != nil {
+			toType = to.inPorts[e.toPort]
+		}
+		if ok, _ := assignable(from.outT, toType); !ok {
 			return nil, fmt.Errorf("graph: compile: edge %q.%s -> %q.%s: %s not assignable to %s",
-				e.from, e.fromPort, e.to, e.toPort, from.outT, to.inT)
+				e.from, e.fromPort, e.to, e.toPort, from.outT, toType)
 		}
 	}
 	if ok, _ := assignable(g.inT, g.entry.inT); !ok {
@@ -198,6 +205,12 @@ func (g *Graph[I, O]) buildLinearPipeline() (*linearPipeline, error) {
 		// A Branch lowers to multiple edges from distinct fromPorts; any
 		// non-portOut source port means a fan-out node → not linear.
 		if e.fromPort != portOut {
+			return nil, nil
+		}
+		// A fan-in combiner consumes on a named input port (not portIn); the
+		// linear walk's Run only threads portIn, so any such edge means the
+		// graph is not a simple single-port chain → not linear.
+		if e.toPort != portIn {
 			return nil, nil
 		}
 		outdeg[e.from]++

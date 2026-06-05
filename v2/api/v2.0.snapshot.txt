@@ -165,11 +165,14 @@ var ErrUninstrumentedInterrupt = errors.New("flow: node returned InterruptError 
 package github.com/costa92/llm-agent-flow/v2/flow/graph
 func AddBranch[GI, GO, T any](g *Graph[GI, GO], id string, key func(context.Context, T) (string, error), routes map[string]NodeRef) (NodeRef, error)
 func AddChatModelNode[GI, GO any](g *Graph[GI, GO], id string, m llm.ChatModel) (NodeRef, error)
+func AddCombine[GI, GO, Out any](g *Graph[GI, GO], id string, sources map[string]NodeRef, combine func(ctx context.Context, in map[string]any) (Out, error)) (NodeRef, error)
 func AddLambdaNode[GI, GO, In, Out any](g *Graph[GI, GO], id string, fn func(context.Context, In) (Out, error)) (NodeRef, error)
+func AddParallel[GI, GO, In any](g *Graph[GI, GO], id string, branches map[string]NodeRef) (NodeRef, error)
 func AddPassthroughNode[GI, GO, T any](g *Graph[GI, GO], id string) (NodeRef, error)
 func AddTemplateNode[GI, GO any](g *Graph[GI, GO], id string, t prompt.Requester) (NodeRef, error)
 func AddToolNode[GI, GO any](g *Graph[GI, GO], id string, t agents.Tool) (NodeRef, error)
 method (*Graph[I, O]) AddEdge(from, to NodeRef) error
+method (*Graph[I, O]) AddEdgeTo(from, to NodeRef, toPort string) error
 method (*Graph[I, O]) Compile(_ context.Context, opts ...flow.EngineOption) (*Runnable[I, O], error)
 method (*Graph[I, O]) Entry(to NodeRef) error
 method (*Graph[I, O]) Exit(from NodeRef) error
