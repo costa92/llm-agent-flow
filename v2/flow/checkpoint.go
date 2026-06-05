@@ -30,6 +30,11 @@ type Checkpoint struct {
 	RunID    string `json:"run_id"`
 	FlowID   string `json:"flow_id"`
 	FlowHash string `json:"flow_hash"` // sha256 of canonical v2 Flow JSON
+	// StructHash is the sha256 of the flow's structural descriptor (node
+	// port sets + edge wiring, EXCLUDING Node.Config). Written at Version
+	// 2+. Empty on v1 checkpoints → Resume falls back to strict FlowHash
+	// compare (config-only resume is not offered for v1). See resume.go.
+	StructHash string `json:"struct_hash,omitempty"`
 
 	PortValues   map[string]map[string]json.RawMessage `json:"port_values"`   // node -> port -> type-tagged JSON
 	Activated    map[string]bool                       `json:"activated"`     // authoritative resume cursor

@@ -37,7 +37,17 @@ func (e *Engine) Resume(ctx context.Context, runID, token string, humanInput map
 		// failure as a permanent missing checkpoint.
 		return RunResult{}, fmt.Errorf("flow: resume: load checkpoint: %w", err)
 	}
-	if cp.FlowHash != e.flowHash {
+	switch {
+	case cp.FlowHash == e.flowHash:
+		// identical flow — fast path, allow.
+	case cp.StructHash != "":
+		// v2 checkpoint: allow iff the STRUCTURE is unchanged (only Config
+		// differs). A struct-hash mismatch means ports/edges/topology changed.
+		if cp.StructHash != e.structHash {
+			return RunResult{}, ErrFlowChanged
+		}
+	default:
+		// v1 checkpoint (no StructHash) or otherwise: strict full-hash compare.
 		return RunResult{}, ErrFlowChanged
 	}
 

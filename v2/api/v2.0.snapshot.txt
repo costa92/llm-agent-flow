@@ -61,6 +61,7 @@ type Checkpoint struct
 	field OriginalInputs map[string]json.RawMessage
 	field PortValues map[string]map[string]json.RawMessage
 	field RunID string
+	field StructHash string
 	field SuspendLayer int
 	field Version int
 type CheckpointMeta struct

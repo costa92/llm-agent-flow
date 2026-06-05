@@ -50,6 +50,12 @@ type Engine struct {
 	// flowHash is the sha256 of the canonical v2 Flow JSON, used to
 	// detect a changed flow definition on Resume.
 	flowHash string
+
+	// structHash is the sha256 of the canonical STRUCTURAL descriptor of
+	// the compiled flow (node port sets + edge wiring, EXCLUDING
+	// Node.Config). Used on Resume to allow a config-only change while
+	// still rejecting any structural change. See structuralHash.
+	structHash string
 }
 
 // EngineOption configures Compile.
@@ -167,6 +173,15 @@ func Compile(f Flow, reg *NodeRegistry, deps Deps, opts ...EngineOption) (*Engin
 	sum := sha256.Sum256(b)
 	flowHash := hex.EncodeToString(sum[:])
 
+	// StructHash: sha256 of the canonical structural descriptor built from
+	// the RESOLVED nodes (so a config-derived port-set change is caught)
+	// plus the edge wiring. Computed here, after nodes are resolved and
+	// layers are built, alongside flowHash.
+	structHash, err := structuralHash(f, nodes)
+	if err != nil {
+		return nil, fmt.Errorf("flow: compile: %w", err)
+	}
+
 	// Static multi-interrupt check (RV-2): only when a CheckpointStore is
 	// configured. At most one interrupt-capable node per layer — otherwise
 	// the suspend point is ambiguous. Without a store, interrupt-capable
@@ -195,6 +210,7 @@ func Compile(f Flow, reg *NodeRegistry, deps Deps, opts ...EngineOption) (*Engin
 		maxNodeConcurrency: cfg.maxNodeConcurrency,
 		checkpointStore:    cfg.checkpointStore,
 		flowHash:           flowHash,
+		structHash:         structHash,
 	}, nil
 }
 
@@ -585,10 +601,11 @@ func (e *Engine) snapshotCheckpoint(runID string, layerIdx int, pend pendingInte
 	}
 
 	return Checkpoint{
-		Version:         1,
+		Version:         2,
 		RunID:           runID,
 		FlowID:          e.flow.ID,
 		FlowHash:        e.flowHash,
+		StructHash:      e.structHash,
 		PortValues:      pv,
 		Activated:       act,
 		EdgeStates:      es,

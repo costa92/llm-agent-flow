@@ -473,9 +473,12 @@ func TestResume_FlowChanged(t *testing.T) {
 		t.Fatalf("run resumable: %v", err)
 	}
 
-	// A structurally different flow → different FlowHash.
+	// A STRUCTURALLY different flow (extra node + edge) → different struct
+	// hash. (A Description-only change is now resume-safe by design — only
+	// structural changes reject; see TestResume_ConfigChangeAllowed.)
 	f2, reg2 := headlineFlow(t, newInterruptNode("in", "out", InterruptRequest{Prompt: "p"}))
-	f2.Description = "changed"
+	f2.Nodes = append(f2.Nodes, Node{ID: "extra", Type: "out"})
+	f2.Edges = append(f2.Edges, Edge{Source: PortRef{"entry", "out"}, Target: PortRef{"extra", "in"}})
 	eng2, err := Compile(f2, reg2, Deps{}, WithCheckpointStore(store))
 	if err != nil {
 		t.Fatalf("compile2: %v", err)
