@@ -42,9 +42,14 @@ type graphNode struct {
 }
 
 // graphEdge records a build-time-accepted connection between two nodes.
+// fromPort/toPort name the source/target ports; both default to the
+// single-port portOut/portIn. Multi-output nodes (Branch) set fromPort to
+// a route-key port name.
 type graphEdge struct {
-	from string
-	to   string
+	from     string
+	to       string
+	fromPort string
+	toPort   string
 }
 
 // Graph is a typed DAG builder parameterised on its overall input I and

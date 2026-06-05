@@ -47,7 +47,7 @@ func (g *Graph[I, O]) Compile(_ context.Context, opts ...flow.EngineOption) (*Ru
 		from, to := g.byID[e.from], g.byID[e.to]
 		if ok, _ := assignable(from.outT, to.inT); !ok {
 			return nil, fmt.Errorf("graph: compile: edge %q.%s -> %q.%s: %s not assignable to %s",
-				e.from, portOut, e.to, portIn, from.outT, to.inT)
+				e.from, e.fromPort, e.to, e.toPort, from.outT, to.inT)
 		}
 	}
 	if ok, _ := assignable(g.inT, g.entry.inT); !ok {
@@ -77,8 +77,8 @@ func (g *Graph[I, O]) Compile(_ context.Context, opts ...flow.EngineOption) (*Ru
 	irEdges := make([]flow.Edge, 0, len(g.edges))
 	for _, e := range g.edges {
 		irEdges = append(irEdges, flow.Edge{
-			Source: flow.PortRef{Node: e.from, Port: portOut},
-			Target: flow.PortRef{Node: e.to, Port: portIn},
+			Source: flow.PortRef{Node: e.from, Port: e.fromPort},
+			Target: flow.PortRef{Node: e.to, Port: e.toPort},
 		})
 	}
 
@@ -120,4 +120,13 @@ func (r *Runnable[I, O]) Invoke(ctx context.Context, in I) (O, error) {
 		return zero, fmt.Errorf("graph: invoke: output is %T, not assignable to %s", raw, r.outT)
 	}
 	return typed, nil
+}
+
+// Stream runs the compiled graph and returns the engine's lifecycle event
+// channel, boxing in into the engine input port. The channel is closed
+// after the terminal event. The graph output is delivered via the FlowDone
+// event's Outputs map (keyed by graphOutputKey) rather than unboxed to O —
+// callers wanting the typed result should use Invoke.
+func (r *Runnable[I, O]) Stream(ctx context.Context, in I) (<-chan flow.Event, error) {
+	return r.engine.RunStream(ctx, map[string]any{graphInputKey: in})
 }

@@ -53,7 +53,7 @@ func (g *Graph[I, O]) AddEdge(from, to NodeRef) error {
 		return g.latch(fmt.Errorf("graph: edge %q.%s -> %q.%s: %s not assignable to %s",
 			from.id, portOut, to.id, portIn, from.outT, to.inT))
 	}
-	g.edges = append(g.edges, graphEdge{from: from.id, to: to.id})
+	g.edges = append(g.edges, graphEdge{from: from.id, to: to.id, fromPort: portOut, toPort: portIn})
 	return nil
 }
 
