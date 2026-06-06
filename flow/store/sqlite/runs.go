@@ -40,11 +40,13 @@ func (s *Store) FinishRun(ctx context.Context, runID string, outputs map[string]
 	if errMsg != "" {
 		status = flowstore.RunStatusFailed
 	}
+	// FC-NEW1: allow suspended runs to transition to a terminal state, in
+	// addition to running runs.
 	res, err := s.db.ExecContext(ctx,
 		`UPDATE runs
 		   SET status = ?, finished_at = ?, outputs_json = ?, error_msg = ?
-		 WHERE id = ? AND status = ?`,
-		string(status), nowUnix(), string(outputsJSON), errMsg, runID, string(flowstore.RunStatusRunning),
+		 WHERE id = ? AND status IN ('running', 'suspended')`,
+		string(status), nowUnix(), string(outputsJSON), errMsg, runID,
 	)
 	if err != nil {
 		return fmt.Errorf("flow/store/sqlite: finish run: %w", err)
@@ -63,21 +65,55 @@ func (s *Store) FinishRun(ctx context.Context, runID string, outputs map[string]
 	return nil
 }
 
+// SuspendRun transitions a run to "suspended" (HITL pause), recording the
+// resume token and the interrupting node id. Re-suspending an already
+// suspended run is idempotent. This is an optional store capability (not
+// part of the Store interface) — callers type-assert for it, mirroring
+// AppendRunEvents.
+//
+// 0-rows semantics match FinishRun: a missing run returns ErrNotFound; a
+// run already in a terminal state is a no-op.
+func (s *Store) SuspendRun(ctx context.Context, runID, resumeToken, interruptNodeID string) error {
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE runs
+		   SET status = 'suspended', resume_token = ?, interrupt_node = ?
+		 WHERE id = ? AND status IN ('running', 'suspended')`,
+		resumeToken, interruptNodeID, runID,
+	)
+	if err != nil {
+		return fmt.Errorf("flow/store/sqlite: suspend run: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		// Already terminal OR unknown id. Distinguish for the caller.
+		var dummy string
+		if err := s.db.QueryRowContext(ctx, `SELECT id FROM runs WHERE id = ?`, runID).Scan(&dummy); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return flowstore.ErrNotFound
+			}
+			return fmt.Errorf("flow/store/sqlite: suspend run probe: %w", err)
+		}
+		// Already terminal — idempotent no-op.
+	}
+	return nil
+}
+
 // GetRun implements flow/store.Store.
 func (s *Store) GetRun(ctx context.Context, runID string) (flowstore.RunRecord, error) {
 	row := s.db.QueryRowContext(ctx,
-		`SELECT id, flow_id, status, started_at, finished_at, inputs_json, outputs_json, error_msg
+		`SELECT id, flow_id, status, started_at, finished_at, inputs_json, outputs_json, error_msg, resume_token, interrupt_node
 		   FROM runs WHERE id = ?`, runID)
 	var (
-		rec         flowstore.RunRecord
-		status      string
-		startedAt   int64
-		finishedAt  sql.NullInt64
-		inputsJSON  sql.NullString
-		outputsJSON sql.NullString
-		errMsg      sql.NullString
+		rec           flowstore.RunRecord
+		status        string
+		startedAt     int64
+		finishedAt    sql.NullInt64
+		inputsJSON    sql.NullString
+		outputsJSON   sql.NullString
+		errMsg        sql.NullString
+		resumeToken   sql.NullString
+		interruptNode sql.NullString
 	)
-	if err := row.Scan(&rec.ID, &rec.FlowID, &status, &startedAt, &finishedAt, &inputsJSON, &outputsJSON, &errMsg); err != nil {
+	if err := row.Scan(&rec.ID, &rec.FlowID, &status, &startedAt, &finishedAt, &inputsJSON, &outputsJSON, &errMsg, &resumeToken, &interruptNode); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return flowstore.RunRecord{}, flowstore.ErrNotFound
 		}
@@ -97,6 +133,12 @@ func (s *Store) GetRun(ctx context.Context, runID string) (flowstore.RunRecord, 
 	}
 	if errMsg.Valid {
 		rec.Error = errMsg.String
+	}
+	if resumeToken.Valid {
+		rec.ResumeToken = resumeToken.String
+	}
+	if interruptNode.Valid {
+		rec.InterruptNode = interruptNode.String
 	}
 	return rec, nil
 }

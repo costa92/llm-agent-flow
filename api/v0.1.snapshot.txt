@@ -22,6 +22,8 @@ type Config struct
 	field Registry *flow.NodeRegistry
 	field Store flowstore.Store
 	field Tools flow.ToolMap
+	field V2Checkpoints v2flow.CheckpointStore
+	field V2Registry *v2flow.NodeRegistry
 type Server struct
 var ErrUnauthorized = errors.New("unauthorized")
 package github.com/costa92/llm-agent-flow/examples/echo_chain
@@ -133,12 +135,15 @@ package github.com/costa92/llm-agent-flow/flow/store
 const RunEventFlowDone RunEventKind = "flow_done"
 const RunEventFlowErr RunEventKind = "flow_err"
 const RunEventFlowStarted RunEventKind = "flow_started"
+const RunEventFlowSuspended RunEventKind = "flow_suspended"
 const RunEventNodeFinished RunEventKind = "node_finished"
+const RunEventNodeInterrupted RunEventKind = "node_interrupted"
 const RunEventNodeSkipped RunEventKind = "node_skipped"
 const RunEventNodeStarted RunEventKind = "node_started"
 const RunStatusDone RunStatus = "done"
 const RunStatusFailed RunStatus = "failed"
 const RunStatusRunning RunStatus = "running"
+const RunStatusSuspended RunStatus = "suspended"
 type FlowMeta struct
 	field CreatedAt time.Time
 	field ID string
@@ -167,7 +172,9 @@ type RunMeta struct
 type RunRecord struct
 	field Error string
 	field Inputs map[string]string
+	field InterruptNode string
 	field Outputs map[string]string
+	field ResumeToken string
 	field RunMeta
 type RunStatus string
 type Store interface
@@ -198,6 +205,7 @@ method (*Store) ListRunEvents(ctx context.Context, runID string, limit int) ([]f
 method (*Store) ListRuns(ctx context.Context, flowID string, limit int) ([]flowstore.RunMeta, error)
 method (*Store) PutFlow(ctx context.Context, id, name string, jsonBytes []byte, create bool) (flowstore.FlowRecord, error)
 method (*Store) StartRun(ctx context.Context, flowID string, inputs map[string]string) (string, error)
+method (*Store) SuspendRun(ctx context.Context, runID, resumeToken, interruptNodeID string) error
 type Store struct
 package github.com/costa92/llm-agent-flow/flow/tools
 method (*KindRegistry) Build(m Manifest) ([]flow.Tool, error)

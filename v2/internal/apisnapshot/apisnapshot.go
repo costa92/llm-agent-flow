@@ -1,5 +1,5 @@
-// Package apisnapshot is the v1.0 exported-API-surface snapshot gate for
-// llm-agent-rag.
+// Package apisnapshot is the v2.0 exported-API-surface snapshot gate for
+// the llm-agent-flow/v2 module.
 //
 // It contains a pure-stdlib generator (built on go/parser, go/ast,
 // go/token and go/printer — no module dependency) that walks the module's
@@ -36,10 +36,10 @@ import (
 	"strings"
 )
 
-const modulePath = "github.com/costa92/llm-agent-flow"
+const modulePath = "github.com/costa92/llm-agent-flow/v2"
 
 // header is the fixed first line of every generated snapshot.
-const header = "# llm-agent-flow v0.1 exported API snapshot — generated, do not hand-edit."
+const header = "# llm-agent-flow/v2 v2.0 exported API snapshot — generated, do not hand-edit."
 
 // symbol is one rendered exported declaration within a package.
 type symbol struct {
