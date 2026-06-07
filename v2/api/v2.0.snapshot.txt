@@ -183,8 +183,10 @@ func AddLambdaNode[GI, GO, In, Out any](g *Graph[GI, GO], id string, fn func(con
 func AddParallel[GI, GO, In any](g *Graph[GI, GO], id string, branches map[string]NodeRef) (NodeRef, error)
 func AddPassthroughNode[GI, GO, T any](g *Graph[GI, GO], id string) (NodeRef, error)
 func AddStatefulLambdaNode[GI, GO, In, Out, S any](g *Graph[GI, GO], id string, fn func(ctx context.Context, in In, state S) (Out, error)) (NodeRef, error)
+func AddStreamMerge[GI, GO, T, R any]( 	g *Graph[GI, GO], id string, 	sources map[string]NodeRef, 	combine func(ctx context.Context, items []T) (R, error), ) (NodeRef, error)
 func AddTemplateNode[GI, GO any](g *Graph[GI, GO], id string, t prompt.Requester) (NodeRef, error)
 func AddToolNode[GI, GO any](g *Graph[GI, GO], id string, t agents.Tool) (NodeRef, error)
+func AddZip[GI, GO, T, R any]( 	g *Graph[GI, GO], id string, 	sources map[string]NodeRef, 	combine func(ctx context.Context, perSource [][]T) (R, error), ) (NodeRef, error)
 func Copy[T any](src StreamReader[T], n int) []StreamReader[T]
 method (*Graph[I, O]) AddEdge(from, to NodeRef) error
 method (*Graph[I, O]) AddEdgeTo(from, to NodeRef, toPort string) error

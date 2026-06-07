@@ -27,20 +27,34 @@ type streamGraphPlan struct {
 }
 
 // streamGraphNode is one node in a stream-graph plan: its prebuilt adapter, the
-// optional streamNode / copy / branch capability flags, declared types, and its
-// outgoing edges keyed by the source-port name (portOut for ordinary nodes;
-// route-key ports for a branch; target-key ports for a copy).
+// optional streamNode / copy / merge / branch capability flags, declared types,
+// and its outgoing edges keyed by the source-port name (portOut for ordinary
+// nodes; route-key ports for a branch; target-key ports for a copy).
 type streamGraphNode struct {
 	id     string
 	kind   flow.NodeKind
 	stream streamNode // non-nil iff kind implements streamNode
 	copy   copyKind   // non-nil iff kind is a *copyAdapter[...]
+	merge  mergeKind  // non-nil iff kind is a streaming merge / zip node
 	branch bool       // true iff kind is a branch
 	inT    reflect.Type
 	outT   reflect.Type
 	// out maps a source-port name to the single target node id reachable from
-	// that port. portOut for ordinary nodes; target-key ports for a copy.
+	// that port. portOut for ordinary nodes; target-key ports for a copy. A
+	// merge node has a single portOut edge to its continuation.
 	out map[string]string
+	// sources lists the INBOUND source-key edges of a merge node (sorted by
+	// key); empty for every non-merge node. It is the fan-in dual of out: the
+	// executor walks each source's subtree and interleaves them.
+	sources []mergeSource
+}
+
+// mergeSource is one inbound edge of a merge node: the source-key port and the
+// id of the node feeding it. fanInMerge walks each source's subtree (from the
+// graph entry value) to a stream and interleaves them in sorted-key order.
+type mergeSource struct {
+	key   string
+	srcID string
 }
 
 // buildStreamGraphPlan analyses the graph for the Copy-bearing streamable-DAG
@@ -62,15 +76,19 @@ func (g *Graph[I, O]) buildStreamGraphPlan() (*streamGraphPlan, error) {
 	}
 	byID := make(map[string]built, len(g.nodes))
 	hasCopy := false
+	hasMerge := false
+	mergeIDs := make(map[string]mergeKind) // merge node id -> its capability
 	for _, n := range g.nodes {
 		kind := n.newKind()
-		// Whitelist: streamNode (chatModel), copy fan-out, branch, or a value
-		// node (lambda/template/tool/passthrough). Anything else → degrade.
+		// Whitelist: streamNode (chatModel), copy fan-out, merge fan-in, branch,
+		// or a value node (lambda/template/tool/passthrough). Anything else →
+		// degrade.
 		_, isStream := kind.(streamNode)
 		_, isCopy := kind.(copyKind)
+		mk, isMerge := kind.(mergeKind)
 		_, isBranch := kind.(branchKind)
 		switch {
-		case isStream, isCopy, isBranch:
+		case isStream, isCopy, isMerge, isBranch:
 		default:
 			if !isValueNode(kind) {
 				return nil, nil // unknown / non-whitelisted kind → degrade
@@ -79,29 +97,47 @@ func (g *Graph[I, O]) buildStreamGraphPlan() (*streamGraphPlan, error) {
 		if isCopy {
 			hasCopy = true
 		}
+		if isMerge {
+			hasMerge = true
+			mergeIDs[n.ref.id] = mk
+		}
 		byID[n.ref.id] = built{gn: n, kind: kind}
 	}
-	// No Copy node → not our shape. buildStreamPlan already had its chance
-	// (linear keeps its pipeline; branch-DAG keeps streamPlan); degrade.
-	if !hasCopy {
+	// Neither a Copy nor a Merge node → not our shape. buildStreamPlan already
+	// had its chance (linear keeps its pipeline; branch-DAG keeps streamPlan);
+	// degrade.
+	if !hasCopy && !hasMerge {
+		return nil, nil
+	}
+	// STANDALONE-only MVP: a graph with BOTH a Copy and a Merge is the deferred
+	// diamond (Copy→{A,B}→Merge). The shipped fanOutCopy single-tail model would
+	// silently discard a merge source (round-2 BLOCKER), so degrade — the diamond
+	// is its own future task. fanInMerge is purely additive only when no Copy is
+	// present.
+	if hasCopy && hasMerge {
 		return nil, nil
 	}
 
-	// Reject fan-in (combine: toPort != portIn) and implicit raw-stream tees (a
-	// single SOURCE PORT feeding >1 edge). A Copy node fans out via DISTINCT
-	// target-key ports (each feeding exactly one edge), so per-port fan-out
-	// stays ≤1; an implicit tee (e.g. a chatmodel out-port feeding 2 edges with
-	// NO AddCopy) violates it and degrades — the explicit-node requirement.
-	portFanout := make(map[string]int) // "node\x00port" -> edge count
+	// Edge rules. Reject implicit raw-stream tees (a single STREAM-emitting source
+	// port feeding >1 edge) and unexpected fan-in. A Copy fans out via DISTINCT
+	// target-key ports; a Merge fans IN via DISTINCT source-key ports. So:
+	//   - an edge into a Merge node on a declared source key is ALLOWED (the only
+	//     legal fan-in); any other toPort != portIn degrades (e.g. AddCombine).
+	//   - a value port may feed >1 edge (safe value replication to N merge
+	//     sources — the entry value is boxed independently per source, no
+	//     broadcaster); but a STREAM-emitting port feeding >1 edge is a raw tee
+	//     and still degrades (the preserved implicit-tee guard).
+	// streamEmittingNodes needs the plan nodes; compute the emitting set after the
+	// adjacency is built, then run the tee guard.
 	for _, e := range g.edges {
 		if e.toPort != portIn {
-			return nil, nil // fan-in (combine) → degrade
-		}
-		portFanout[e.from+"\x00"+e.fromPort]++
-	}
-	for _, cnt := range portFanout {
-		if cnt > 1 {
-			return nil, nil // a source port feeding >1 edge = implicit tee → degrade
+			mk, ok := mergeIDs[e.to]
+			if !ok {
+				return nil, nil // fan-in into a non-merge node (combine) → degrade
+			}
+			if !isMergeSourceKey(mk, e.toPort) {
+				return nil, nil // not a declared merge source key → degrade
+			}
 		}
 	}
 
@@ -115,12 +151,14 @@ func (g *Graph[I, O]) buildStreamGraphPlan() (*streamGraphPlan, error) {
 	for id, b := range byID {
 		sn, _ := b.kind.(streamNode)
 		ck, _ := b.kind.(copyKind)
+		mk, _ := b.kind.(mergeKind)
 		_, isBranch := b.kind.(branchKind)
 		plan.nodes[id] = &streamGraphNode{
 			id:     id,
 			kind:   b.kind,
 			stream: sn,
 			copy:   ck,
+			merge:  mk,
 			branch: isBranch,
 			inT:    b.gn.ref.inT,
 			outT:   b.gn.ref.outT,
@@ -132,7 +170,20 @@ func (g *Graph[I, O]) buildStreamGraphPlan() (*streamGraphPlan, error) {
 		if !ok {
 			return nil, nil // edge from an unknown node → degrade
 		}
+		// A merge inbound edge (from a source -> merge.<key>) is recorded on the
+		// MERGE node's sources, not the source's out (the source's out already
+		// carries its single portOut->merge edge below). The source node's
+		// forward edge to the merge is its portOut edge.
+		if dn, ok := plan.nodes[e.to]; ok && dn.merge != nil && e.toPort != portIn {
+			dn.sources = append(dn.sources, mergeSource{key: e.toPort, srcID: e.from})
+		}
 		pn.out[e.fromPort] = e.to
+	}
+	// Sort each merge node's sources by key for deterministic fan-in order.
+	for _, pn := range plan.nodes {
+		if pn.merge != nil && len(pn.sources) > 1 {
+			sortMergeSources(pn.sources)
+		}
 	}
 
 	// Reachability + single-component + acyclicity from entry (static walk over
@@ -158,6 +209,21 @@ func (g *Graph[I, O]) buildStreamGraphPlan() (*streamGraphPlan, error) {
 			}
 		}
 		delete(stack, id)
+		// A merge node is reached by walking INTO it from N source chains; its
+		// source nodes are otherwise unreachable via out (out is fan-out-only).
+		// Visit each source AFTER popping this merge off the stack so the source's
+		// own out-edge back into this merge is not mis-flagged as a cycle (the
+		// source->merge edge is a real forward edge; the merge->source visit here
+		// is only for single-component coverage). Source chains must themselves be
+		// acyclic, so each is walked with a fresh stack.
+		for _, src := range pn.sources {
+			if _, ok := plan.nodes[src.srcID]; !ok {
+				return errDangling
+			}
+			if err := reaches(src.srcID, map[string]bool{}); err != nil {
+				return err
+			}
+		}
 		return nil
 	}
 	if err := reaches(g.entry.id, map[string]bool{}); err != nil {
@@ -179,11 +245,35 @@ func (g *Graph[I, O]) buildStreamGraphPlan() (*streamGraphPlan, error) {
 	// emits a raw stream downstream (it folds-on-input). We compute the
 	// stream-emitting set by propagating from streamNodes through Copy nodes.
 	emitsStream := g.streamEmittingNodes(plan)
+
+	// Implicit-tee guard (preserved, refined): a STREAM-emitting source port
+	// feeding >1 edge is a raw tee with no broadcaster → degrade. A VALUE port
+	// may fan out (safe value replication to N merge sources). Keying on the
+	// (node, port) pair, only stream-emitting ports are counted.
+	streamPortFanout := make(map[string]int) // "node\x00port" -> edge count
+	for _, e := range g.edges {
+		if emitsStream[e.from] {
+			streamPortFanout[e.from+"\x00"+e.fromPort]++
+		}
+	}
+	for _, cnt := range streamPortFanout {
+		if cnt > 1 {
+			return nil, nil // a stream-emitting port feeding >1 edge = implicit tee → degrade
+		}
+	}
+
+	// Folder validation across the whole DAG (Compile-error escalation). A merge
+	// inbound edge is EXEMPT: the merge node owns its combine→fold bridge, so the
+	// per-source stream is folded by the user combine, not a registered
+	// Concatenator. Every other stream→value boundary needs a folder.
 	for _, e := range g.edges {
 		up := plan.nodes[e.from]
 		down := plan.nodes[e.to]
 		if !emitsStream[up.id] {
 			continue // upstream emits a value, never a stream
+		}
+		if down.merge != nil && e.toPort != portIn {
+			continue // merge source boundary: combine folds it, no Concatenator needed
 		}
 		if _, ok := lookupConcat(down.inT); !ok {
 			return nil, fmt.Errorf("graph: compile: stream edge %q -> %q: no Concatenator for %s",
@@ -204,12 +294,14 @@ func (g *Graph[I, O]) buildStreamGraphPlan() (*streamGraphPlan, error) {
 // chainNode accessors for streamGraphNode (see streamdag.go for the
 // streamPlanNode counterpart). asCopy is non-nil iff the node is a Copy
 // fan-out — the boundary at which walkChain stops.
-func (n *streamGraphNode) chainID() string          { return n.id }
-func (n *streamGraphNode) chainKind() flow.NodeKind { return n.kind }
-func (n *streamGraphNode) chainStream() streamNode  { return n.stream }
-func (n *streamGraphNode) chainBranch() bool        { return n.branch }
-func (n *streamGraphNode) chainInT() reflect.Type   { return n.inT }
-func (n *streamGraphNode) chainCopy() copyKind      { return n.copy }
+func (n *streamGraphNode) chainID() string             { return n.id }
+func (n *streamGraphNode) chainKind() flow.NodeKind    { return n.kind }
+func (n *streamGraphNode) chainStream() streamNode     { return n.stream }
+func (n *streamGraphNode) chainBranch() bool           { return n.branch }
+func (n *streamGraphNode) chainInT() reflect.Type      { return n.inT }
+func (n *streamGraphNode) chainCopy() copyKind         { return n.copy }
+func (n *streamGraphNode) chainMerge() mergeKind       { return n.merge }
+func (n *streamGraphNode) chainSources() []mergeSource { return n.sources }
 func (n *streamGraphNode) chainNext(port string) (string, bool) {
 	t, ok := n.out[port]
 	return t, ok
@@ -234,6 +326,8 @@ type chainNode interface {
 	chainBranch() bool
 	chainInT() reflect.Type
 	chainCopy() copyKind
+	chainMerge() mergeKind       // non-nil iff a streaming merge boundary
+	chainSources() []mergeSource // inbound source-key edges (merge nodes only)
 	chainNext(port string) (string, bool)
 	chainTargets() []string // every forward target id (all out ports)
 }
@@ -263,6 +357,15 @@ func walkChain(ctx context.Context, nodeAt func(string) chainNode, startID strin
 		// Copy boundary: stop without running it. The caller tees the carrier
 		// flowing INTO the copy and walks each target subtree concurrently.
 		if pn.chainCopy() != nil {
+			return carrier, pn, nil
+		}
+
+		// Merge boundary: stop without running it. The merge is the INVERSE of a
+		// chain step — reached by walking INTO it from N source chains. The caller
+		// (fanInMerge) drives the N sources concurrently and folds the merged
+		// stream to R via the merge-node-owned combine bridge. A source chain that
+		// reaches its merge returns the carrier flowing INTO the merge here.
+		if pn.chainMerge() != nil {
 			return carrier, pn, nil
 		}
 
@@ -370,6 +473,39 @@ func (r *Runnable[I, O]) runStreamGraph(ctx context.Context, in I) (_ StreamRead
 		}
 	}()
 
+	// STANDALONE merge fan-in: the diamond degrades, so a stream-graph plan has
+	// EITHER a Copy OR a Merge, never both. If it has a merge node, drive the
+	// fan-in: walk every source subtree concurrently from the graph input, fold
+	// the interleaved stream to R via the merge-node-owned combine bridge, then
+	// continue the forward walk from the merge's single portOut.
+	if mergeNode := plan.mergeNode(); mergeNode != nil {
+		carrier, err := r.fanInMerge(ctx, nodeAt, mergeNode, in, live)
+		if err != nil {
+			return nil, err
+		}
+		// Continue from the merge's portOut (or stop if the merge is the sink).
+		if next, ok := mergeNode.chainNext(portOut); ok {
+			carrier, copyNode, err := walkChain(ctx, nodeAt, next, carrier, live)
+			if err != nil {
+				return nil, err
+			}
+			if copyNode != nil {
+				return nil, fmt.Errorf("graph: stream: merge continuation reached an unsupported fan node %q", copyNode.chainID())
+			}
+			reader, err := r.materialiseTail(carrier, live)
+			if err != nil {
+				return nil, err
+			}
+			return &streamGraphReader[O]{inner: reader, cancel: cancel, live: live}, nil
+		}
+		// Merge is the sink: R is the graph output.
+		reader, err := r.materialiseTail(carrier, live)
+		if err != nil {
+			return nil, err
+		}
+		return &streamGraphReader[O]{inner: reader, cancel: cancel, live: live}, nil
+	}
+
 	carrier, copyNode, err := walkChain(ctx, nodeAt, plan.entryID, streamCarrier{value: in}, live)
 	if err != nil {
 		return nil, err
@@ -398,6 +534,161 @@ func (r *Runnable[I, O]) runStreamGraph(ctx context.Context, in I) (_ StreamRead
 	}
 	// The returned reader owns the root ctx + live set: Close cancels everything.
 	return &streamGraphReader[O]{inner: reader, cancel: cancel, live: live}, nil
+}
+
+// mergeNode returns the plan's single merge node, or nil if the plan has none.
+// The diamond degrades, so a stream-graph plan has at most one merge node and no
+// Copy alongside it (the standalone-fan-in MVP invariant). With multiple merge
+// nodes (a future shape) this returns an arbitrary one — not reachable today
+// because such graphs are not yet built.
+func (p *streamGraphPlan) mergeNode() *streamGraphNode {
+	for _, pn := range p.nodes {
+		if pn.merge != nil {
+			return pn
+		}
+	}
+	return nil
+}
+
+// fanInMerge drives a STANDALONE merge: it spawns ONE goroutine per source
+// subtree, each walking its source chain (from the graph input value, replicated
+// — a value, never a stream, so no broadcaster/tee is needed) via walkChain to a
+// terminal carrier, all N CONCURRENT (the round-2 BLOCKER LAW — sequential source
+// materialisation deadlocks). Each source's terminal carrier becomes a
+// StreamReader[any] of T (a value source is boxed to a single-frame stream; a
+// stream source whose elem type already is T is used directly; a stream source
+// whose elem type differs from T is folded to T then boxed). Every frame is
+// tagged with its source index so the (zip) fold can reconstruct per-source
+// lists; the unordered fold ignores the tag.
+//
+// The N readers are collected in SORTED-KEY order, registered in liveSet
+// independently, and interleaved by Merge[any] (unordered) or roundRobinMerge[any]
+// (ordered/zip). The merged reader's elemT is re-stamped to the merge node's
+// declared T. The merged stream is then folded to R by the MERGE-NODE-OWNED
+// combine bridge (mergeKind.mergeFold — drain merged stream -> []T / [][]T ->
+// combine), NOT the global lookupConcat. The folded R is returned as a value
+// carrier for the forward continuation.
+func (r *Runnable[I, O]) fanInMerge(ctx context.Context, nodeAt func(string) chainNode, mergeNode *streamGraphNode, in I, live *liveSet) (streamCarrier, error) {
+	mk := mergeNode.chainMerge()
+	sources := mergeNode.chainSources() // sorted by key at plan build
+	n := len(sources)
+	declT := mk.mergeElemT()
+
+	// Spawn one goroutine per source; each walks its subtree to a terminal
+	// carrier concurrently. A per-source error is captured; the boxed graph input
+	// is replicated to every source (a value, safe to share).
+	type srcResult struct {
+		carrier streamCarrier
+		err     error
+	}
+	results := make([]srcResult, n)
+	var wg sync.WaitGroup
+	wg.Add(n)
+	for i, src := range sources {
+		go func(i int, srcID string) {
+			defer wg.Done()
+			// Each source subtree gets its OWN liveSet bookkeeping via the shared
+			// live set; walkChain registers any intermediate stream there.
+			carrier, boundary, err := walkChain(ctx, nodeAt, srcID, streamCarrier{value: in}, live)
+			if err != nil {
+				results[i] = srcResult{err: err}
+				return
+			}
+			// The source chain ENDS at THIS merge (its last node's portOut edge
+			// feeds the merge) — walkChain stops at the merge boundary and returns
+			// the carrier flowing INTO it, which is this source's terminal stream.
+			// Any OTHER boundary (a Copy, or a different merge) is out of the
+			// standalone MVP scope.
+			if boundary != nil && boundary.chainID() != mergeNode.chainID() {
+				results[i] = srcResult{err: fmt.Errorf("graph: stream: merge source %q reached an unsupported fan node %q", srcID, boundary.chainID())}
+				return
+			}
+			results[i] = srcResult{carrier: carrier}
+		}(i, src.srcID)
+	}
+	wg.Wait()
+
+	// Collect each source's terminal carrier as a source-tagged StreamReader[any]
+	// of T, in sorted-key (== sources) order. On any source error, release every
+	// reader gathered so far and return the error.
+	readers := make([]StreamReader[any], 0, n)
+	releaseAll := func() {
+		for _, rd := range readers {
+			live.unregister(rd)
+			rd.Close()
+		}
+	}
+	for i := range sources {
+		res := results[i]
+		if res.err != nil {
+			releaseAll()
+			return streamCarrier{}, res.err
+		}
+		rd, err := r.sourceReader(res.carrier, declT, i, live)
+		if err != nil {
+			releaseAll()
+			return streamCarrier{}, err
+		}
+		live.register(rd)
+		readers = append(readers, rd)
+	}
+
+	// Interleave: unordered Merge, ordered roundRobinMerge. The merged reader
+	// erases elemT; re-stamp it to the merge node's declared T.
+	var merged StreamReader[any]
+	if mk.mergeOrdered() {
+		merged = roundRobinMerge[any](readers...)
+	} else {
+		merged = Merge[any](readers...)
+	}
+	for _, rd := range readers {
+		live.unregister(rd) // ownership moves to the merged reader's pullers
+	}
+	live.register(merged)
+
+	// Fold the merged stream to R via the merge-node-owned combine bridge (NOT
+	// global lookupConcat). The fold drains + Closes the merged stream (which
+	// cascades Close to every source reader). Unregister it from live first so
+	// closeAll does not double-close the now-consumed stream.
+	live.unregister(merged)
+	out, err := mk.mergeFold(ctx, merged)
+	if err != nil {
+		return streamCarrier{}, err
+	}
+	return streamCarrier{value: out}, nil
+}
+
+// sourceReader turns one source's terminal carrier into a source-tagged
+// StreamReader[any] of element type declT (the merge's declared T):
+//   - a stream whose elem type IS declT is used directly (multi-frame);
+//   - a stream whose elem type differs from declT is folded to declT via the
+//     registered Concatenator then boxed to a single declT frame;
+//   - a value is asserted to declT and boxed to a single frame.
+//
+// Every yielded frame is wrapped in a mergeSrcFrame{srcIdx} so the ordered fold
+// can reconstruct per-source lists. The intermediate (pre-tag) stream carrier is
+// unregistered from live as its ownership moves into the tagged wrapper.
+func (r *Runnable[I, O]) sourceReader(carrier streamCarrier, declT reflect.Type, srcIdx int, live *liveSet) (StreamReader[any], error) {
+	if carrier.isStream {
+		if carrier.elemT == declT {
+			live.unregister(carrier.stream)
+			return tagSource(carrier.stream, srcIdx), nil
+		}
+		// elem type != declT: fold to declT (one value), then box.
+		live.unregister(carrier.stream)
+		fold, ok := lookupConcat(declT)
+		if !ok {
+			carrier.stream.Close()
+			return nil, fmt.Errorf("graph: stream: merge source: no Concatenator for %s", declT)
+		}
+		v, err := fold(carrier.stream)
+		if err != nil {
+			return nil, err
+		}
+		return tagSource(box(v), srcIdx), nil
+	}
+	// Value source: box to a single declT frame.
+	return tagSource(box(carrier.value), srcIdx), nil
 }
 
 // fanOutCopy tees the carrier flowing into copyNode and drives every target
