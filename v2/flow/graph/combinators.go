@@ -293,3 +293,146 @@ func (m *mergeReader[T]) Close() error {
 	}()
 	return nil
 }
+
+// roundRobinMerge interleaves srcs into a single StreamReader with a
+// DETERMINISTIC output order: source 0's next frame, source 1's next frame, …,
+// repeating; a source at io.EOF is skipped; ragged lengths drain the remaining
+// sources. It returns a clean io.EOF only after EVERY source has hit io.EOF. A
+// non-EOF error from any source is surfaced through Next. Close releases all
+// sources.
+//
+// Determinism with concurrency: ONE puller goroutine per source feeds a
+// PER-SOURCE bounded channel (buf 1 — the lookahead); Next selects from those
+// channels in fixed source-index order. Because the pullers run concurrently and
+// each has a buf-1 lookahead, a source feeding off a shared upstream Copy never
+// wedges the broadcaster while Next is blocked receiving from a sibling — the
+// round-2 R-ZIPDEADLOCK mitigation. Output order is fixed by source index +
+// frame index, independent of arrival timing, so the merged sequence is
+// reproducible (the zip cross-validator).
+//
+// Zero srcs returns an immediately-EOF reader.
+func roundRobinMerge[T any](srcs ...StreamReader[T]) StreamReader[T] {
+	ctx, cancel := context.WithCancel(context.Background())
+	chans := make([]chan mergeItem[T], len(srcs))
+	for i, src := range srcs {
+		ch := make(chan mergeItem[T], mergeBufSize)
+		chans[i] = ch
+		// One puller per source into its OWN channel; the puller closes its
+		// channel on exit so Next detects an exhausted source as a closed
+		// channel and skips it.
+		go pullRoundRobin(ctx, src, ch)
+	}
+	return &roundRobinReader[T]{chans: chans, ctx: ctx, cancel: cancel, exhausted: make([]bool, len(srcs))}
+}
+
+// pullRoundRobin pulls one source into its OWN per-source channel until the
+// source ends (io.EOF, an error, or the shared context is cancelled), then
+// closes the channel so the reader's Next sees the source is done. It forwards a
+// non-EOF error as a terminal frame, then closes. `defer src.Close()` releases
+// the source on every exit path; `defer close(ch)` lets Next skip the exhausted
+// source. It is the per-source analogue of pullMerge (which shares one channel
+// closed by a separate closer after a WaitGroup).
+func pullRoundRobin[T any](ctx context.Context, src StreamReader[T], ch chan mergeItem[T]) {
+	defer close(ch)
+	defer src.Close()
+	for {
+		v, err := src.Next()
+		if err != nil {
+			if err == io.EOF {
+				return
+			}
+			select {
+			case ch <- mergeItem[T]{err: err}:
+			case <-ctx.Done():
+			}
+			return
+		}
+		select {
+		case ch <- mergeItem[T]{v: v}:
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+// roundRobinReader is the roundRobinMerge reader. It selects frames from its
+// per-source channels in fixed index order, skipping exhausted (closed-channel)
+// sources, and applies the Phase-2 two-stage Close.
+type roundRobinReader[T any] struct {
+	mu        sync.Mutex
+	chans     []chan mergeItem[T]
+	ctx       context.Context
+	cancel    context.CancelFunc
+	cur       int    // next source index to try (round-robin cursor)
+	exhausted []bool // exhausted[i] == true once source i's channel is closed
+	closed    bool
+}
+
+func (m *roundRobinReader[T]) Next() (T, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var zero T
+	if m.closed {
+		return zero, io.EOF
+	}
+	n := len(m.chans)
+	if n == 0 {
+		return zero, io.EOF
+	}
+	// Round-robin over the sources: advance cur to the next non-exhausted
+	// source and receive its next frame. A closed channel marks that source
+	// exhausted; when ALL are exhausted, return io.EOF.
+	for {
+		// Find the next non-exhausted source starting at cur.
+		picked := -1
+		for off := 0; off < n; off++ {
+			i := (m.cur + off) % n
+			if !m.exhausted[i] {
+				picked = i
+				break
+			}
+		}
+		if picked < 0 {
+			return zero, io.EOF // every source exhausted
+		}
+		frame, ok := <-m.chans[picked]
+		if !ok {
+			// Source done (puller exited, channel closed). Skip it and keep the
+			// cursor where it is so the next non-exhausted source is tried.
+			m.exhausted[picked] = true
+			m.cur = picked
+			continue
+		}
+		// Advance the cursor PAST the picked source so the next Next tries the
+		// following source (true round-robin).
+		m.cur = (picked + 1) % n
+		if frame.err != nil {
+			return zero, frame.err
+		}
+		return frame.v, nil
+	}
+}
+
+func (m *roundRobinReader[T]) Close() error {
+	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return nil
+	}
+	m.closed = true
+	m.mu.Unlock()
+
+	// Stage 1: signal all pullers to stop.
+	m.cancel()
+	// Stage 2: drain EVERY per-source channel so any puller mid-send unblocks;
+	// its `defer src.Close()` then releases the source. Each per-source closer
+	// closes its channel once its puller exits, ending each drain. This is the
+	// round-2 leak gate (the prototype leaked until these stage-2 drains existed).
+	for _, ch := range m.chans {
+		go func(ch chan mergeItem[T]) {
+			for range ch {
+			}
+		}(ch)
+	}
+	return nil
+}
