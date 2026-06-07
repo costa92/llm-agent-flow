@@ -36,6 +36,12 @@ type Runnable[I, O any] struct {
 	// Compile (folder availability included); RegisterConcatenator after Compile
 	// does not retroactively change it.
 	streamPlan *streamPlan
+	// streamGraphPlan is non-nil only for a Copy-bearing streamable DAG (a graph
+	// with explicit AddCopy fan-out nodes). When set — and pipeline/streamPlan
+	// are nil — Stream runs runStreamGraph, a multi-goroutine executor that tees
+	// each Copy via the Phase-2 broadcaster and walks every target subtree
+	// concurrently. Snapshotted at Compile like streamPlan.
+	streamGraphPlan *streamGraphPlan
 
 	// serializable reports whether every node lowered to a JSON IR form.
 	// lowered holds that IR (valid iff serializable); lowerErr holds the
@@ -64,7 +70,9 @@ type pipelineNode struct {
 // StreamCapable reports whether Stream runs as a true data-level stream
 // (a linear chain OR a streamable branch-DAG) rather than degrading to
 // box(Invoke).
-func (r *Runnable[I, O]) StreamCapable() bool { return r.pipeline != nil || r.streamPlan != nil }
+func (r *Runnable[I, O]) StreamCapable() bool {
+	return r.pipeline != nil || r.streamPlan != nil || r.streamGraphPlan != nil
+}
 
 // Serializable reports whether the graph lowered fully to JSON IR — every
 // node has a serializable form (no Go closure / injected dependency). Only
@@ -187,10 +195,20 @@ func (g *Graph[I, O]) Compile(_ context.Context, opts ...flow.EngineOption) (*Ru
 	// Linear graphs keep pipeline != nil and streamPlan == nil (the byte-
 	// identical oracle path).
 	var splan *streamPlan
+	var sgplan *streamGraphPlan
 	if pipeline == nil {
 		splan, err = g.buildStreamPlan()
 		if err != nil {
 			return nil, err
+		}
+		// Copy-bearing streamable DAG: tried only after buildStreamPlan degrades
+		// (returns nil,nil). Same 3-way contract — (nil,nil) degrades, (nil,err)
+		// is a missing-folder Compile error.
+		if splan == nil {
+			sgplan, err = g.buildStreamGraphPlan()
+			if err != nil {
+				return nil, err
+			}
 		}
 	}
 
@@ -199,14 +217,15 @@ func (g *Graph[I, O]) Compile(_ context.Context, opts ...flow.EngineOption) (*Ru
 	// form (no Go closure / injected dependency).
 	lf, lerr := g.lower()
 	return &Runnable[I, O]{
-		engine:       engine,
-		inT:          g.inT,
-		outT:         g.outT,
-		pipeline:     pipeline,
-		streamPlan:   splan,
-		serializable: lerr == nil,
-		lowered:      lf,
-		lowerErr:     lerr,
+		engine:          engine,
+		inT:             g.inT,
+		outT:            g.outT,
+		pipeline:        pipeline,
+		streamPlan:      splan,
+		streamGraphPlan: sgplan,
+		serializable:    lerr == nil,
+		lowered:         lf,
+		lowerErr:        lerr,
 	}, nil
 }
 
@@ -390,6 +409,8 @@ func (r *Runnable[I, O]) Stream(ctx context.Context, in I) (StreamReader[O], err
 		return r.runLinearStream(ctx, in) // linear: byte-identical oracle path
 	case r.streamPlan != nil:
 		return r.runStreamDAG(ctx, in) // streamable branch-DAG
+	case r.streamGraphPlan != nil:
+		return r.runStreamGraph(ctx, in) // Copy-bearing streamable DAG
 	default:
 		// Degrade: non-linear, non-branch-DAG (or a tee/fan-in shape) → run
 		// Invoke to completion and box the single result. No error.
