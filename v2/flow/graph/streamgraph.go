@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"reflect"
+	"sync"
 
 	"github.com/costa92/llm-agent-flow/v2/flow"
 )
@@ -200,12 +201,388 @@ func (g *Graph[I, O]) buildStreamGraphPlan() (*streamGraphPlan, error) {
 	return plan, nil
 }
 
-// runStreamGraph executes a Copy-bearing stream-graph plan. The executor body
-// (walkChain extraction + concurrent Copy fan-out via the Phase-2 broadcaster)
-// lands in task 2c; this stub keeps the Stream dispatch wired so 2b can
-// classify and assert StreamCapable without yet driving a fan-out.
-func (r *Runnable[I, O]) runStreamGraph(_ context.Context, _ I) (StreamReader[O], error) {
-	return nil, fmt.Errorf("graph: stream: runStreamGraph not yet implemented (task 2c)")
+// chainNode accessors for streamGraphNode (see streamdag.go for the
+// streamPlanNode counterpart). asCopy is non-nil iff the node is a Copy
+// fan-out — the boundary at which walkChain stops.
+func (n *streamGraphNode) chainID() string          { return n.id }
+func (n *streamGraphNode) chainKind() flow.NodeKind { return n.kind }
+func (n *streamGraphNode) chainStream() streamNode  { return n.stream }
+func (n *streamGraphNode) chainBranch() bool        { return n.branch }
+func (n *streamGraphNode) chainInT() reflect.Type   { return n.inT }
+func (n *streamGraphNode) chainCopy() copyKind      { return n.copy }
+func (n *streamGraphNode) chainNext(port string) (string, bool) {
+	t, ok := n.out[port]
+	return t, ok
+}
+func (n *streamGraphNode) chainTargets() []string {
+	ts := make([]string, 0, len(n.out))
+	for _, t := range n.out {
+		ts = append(ts, t)
+	}
+	return ts
+}
+
+// chainNode is the minimal node view walkChain threads over, satisfied by BOTH
+// streamPlanNode (branch-DAG) and streamGraphNode (Copy-DAG). Factoring the walk
+// behind it means there is exactly ONE node-step loop, so the branch-DAG path
+// (runStreamDAG) and the Copy-DAG path (runStreamGraph) can never diverge on how
+// a value/stream/branch node is stepped.
+type chainNode interface {
+	chainID() string
+	chainKind() flow.NodeKind
+	chainStream() streamNode
+	chainBranch() bool
+	chainInT() reflect.Type
+	chainCopy() copyKind
+	chainNext(port string) (string, bool)
+	chainTargets() []string // every forward target id (all out ports)
+}
+
+// walkChain walks a SINGLE chain of the plan from startID, threading an entry
+// carrier through value/stream/branch nodes exactly as the branch-DAG executor
+// always has, registering each live stream in live for deferred cleanup. It
+// STOPS and returns when it reaches either:
+//
+//   - a sink (no portOut edge): returns (carrier, nil, nil) — the caller
+//     materialises the O-typed tail (foldTail[O]/box[O]) at the ROOT, once.
+//   - a Copy node: returns (carrierIntoCopy, copyNode, nil) WITHOUT running the
+//     copy — the caller tees and spawns one goroutine per target subtree.
+//
+// It is a SUBTREE primitive: it threads from and to a streamCarrier (never the
+// graph input I or output O), so a Copy target goroutine can walk its subtree
+// from its copyReader entry. ALL O-typed tail logic stays at the root (the
+// divergence trap R6 names) — walkChain never touches O.
+//
+// nodeAt resolves a node id to its chainNode (closes over the concrete plan).
+func walkChain(ctx context.Context, nodeAt func(string) chainNode, startID string, entry streamCarrier, live *liveSet) (streamCarrier, chainNode, error) {
+	carrier := entry
+	cur := startID
+	for {
+		pn := nodeAt(cur)
+
+		// Copy boundary: stop without running it. The caller tees the carrier
+		// flowing INTO the copy and walks each target subtree concurrently.
+		if pn.chainCopy() != nil {
+			return carrier, pn, nil
+		}
+
+		switch {
+		case pn.chainBranch():
+			// Fold any upstream stream to the branch's In type (a value), then
+			// run the branch to select exactly one route, and follow it.
+			if carrier.isStream {
+				live.unregister(carrier.stream)
+				v, err := concatToValue(carrier, pn.chainInT())
+				if err != nil {
+					return streamCarrier{}, nil, err
+				}
+				carrier = streamCarrier{value: v}
+			}
+			out, err := pn.chainKind().Run(ctx, map[string]any{portIn: carrier.value})
+			if err != nil {
+				return streamCarrier{}, nil, err
+			}
+			selPort, selVal, ok := singleEntry(out)
+			if !ok {
+				return streamCarrier{}, nil, fmt.Errorf("graph: stream: branch %q produced %d outputs, want exactly 1", pn.chainID(), len(out))
+			}
+			target, ok := pn.chainNext(selPort)
+			if !ok {
+				return streamCarrier{}, nil, fmt.Errorf("graph: stream: branch %q selected port %q has no edge", pn.chainID(), selPort)
+			}
+			carrier = streamCarrier{value: selVal}
+			cur = target
+			continue
+
+		case pn.chainStream() != nil:
+			// Stream node: needs a materialised input; fold upstream if needed.
+			if carrier.isStream {
+				live.unregister(carrier.stream)
+				v, err := concatToValue(carrier, pn.chainInT())
+				if err != nil {
+					return streamCarrier{}, nil, err
+				}
+				carrier = streamCarrier{value: v}
+			}
+			out, err := pn.chainStream().streamRun(ctx, carrier)
+			if err != nil {
+				return streamCarrier{}, nil, err
+			}
+			carrier = out
+			live.register(carrier.stream)
+
+		default:
+			// Value node: fold upstream stream to its In type, then Run.
+			if carrier.isStream {
+				live.unregister(carrier.stream)
+				v, err := concatToValue(carrier, pn.chainInT())
+				if err != nil {
+					return streamCarrier{}, nil, err
+				}
+				carrier = streamCarrier{value: v}
+			}
+			out, err := pn.chainKind().Run(ctx, map[string]any{portIn: carrier.value})
+			if err != nil {
+				return streamCarrier{}, nil, err
+			}
+			carrier = streamCarrier{value: out[portOut]}
+		}
+
+		// Advance to the single forward edge (portOut). The exit is a sink.
+		next, ok := pn.chainNext(portOut)
+		if !ok {
+			return carrier, nil, nil // reached the sink
+		}
+		cur = next
+	}
+}
+
+// runStreamGraph executes a Copy-bearing stream-graph plan. It walks from entry
+// via walkChain to the first Copy boundary; at a Copy node it materialises the
+// upstream into a StreamReader[any], tees it with the Phase-2 Copy broadcaster,
+// and spawns ONE goroutine PER TARGET SUBTREE, each walking its subtree
+// concurrently from its own copyReader. Concurrency is mandatory: the
+// broadcaster fills every consumer's buf-1 channel for each frame before
+// advancing, so sequential subtree walks would deadlock (round-2 BLOCKER).
+//
+// The graph's single declared output comes from exactly ONE target subtree (the
+// one on the path to the exit sink); the other subtrees are independent leaves
+// driven to completion (or cancelled on early-Close). The O-typed tail is
+// materialised at the ROOT, once.
+func (r *Runnable[I, O]) runStreamGraph(ctx context.Context, in I) (_ StreamReader[O], retErr error) {
+	plan := r.streamGraphPlan
+	nodeAt := func(id string) chainNode {
+		pn, ok := plan.nodes[id]
+		if !ok {
+			return nil
+		}
+		return pn
+	}
+
+	// One root cancel-ctx owns every subtree goroutine + broadcaster; cancelled
+	// on any error return or via the returned reader's Close.
+	ctx, cancel := context.WithCancel(ctx)
+	live := &liveSet{}
+	defer func() {
+		if retErr != nil {
+			cancel()
+			live.closeAll()
+		}
+	}()
+
+	carrier, copyNode, err := walkChain(ctx, nodeAt, plan.entryID, streamCarrier{value: in}, live)
+	if err != nil {
+		return nil, err
+	}
+	if copyNode == nil {
+		// No Copy was actually reached at run time (a Copy could sit on an
+		// unselected branch route). Materialise the tail like runStreamDAG; the
+		// single live stream, if any, is now owned by the tail.
+		reader, err := r.materialiseTail(carrier, live)
+		if err != nil {
+			return nil, err
+		}
+		cancel() // nothing concurrent to keep alive
+		return reader, nil
+	}
+
+	// Reached a Copy boundary. Tee the carrier flowing into the copy and walk
+	// each target subtree concurrently.
+	tailCarrier, err := r.fanOutCopy(ctx, nodeAt, plan, copyNode, carrier, live)
+	if err != nil {
+		return nil, err
+	}
+	reader, err := r.materialiseTail(tailCarrier, live)
+	if err != nil {
+		return nil, err
+	}
+	// The returned reader owns the root ctx + live set: Close cancels everything.
+	return &streamGraphReader[O]{inner: reader, cancel: cancel, live: live}, nil
+}
+
+// fanOutCopy tees the carrier flowing into copyNode and drives every target
+// subtree CONCURRENTLY (one goroutine per non-tail target), returning the tail
+// subtree's final carrier (walked on the calling goroutine). The tail target is
+// the one whose subtree statically reaches the graph exit; the others are
+// independent leaves driven to completion / cancellation.
+//
+// Concurrency is the round-2 BLOCKER fix: the broadcaster fills EVERY consumer
+// channel (buf 1) for each frame before advancing, so all copyReaders must be
+// pulled concurrently — never sibling subtrees one after another on one
+// goroutine.
+func (r *Runnable[I, O]) fanOutCopy(ctx context.Context, nodeAt func(string) chainNode, plan *streamGraphPlan, copyNode chainNode, in streamCarrier, live *liveSet) (streamCarrier, error) {
+	ck := copyNode.chainCopy()
+	keys := ck.copyKeys()
+	n := len(keys)
+
+	// Materialise the upstream into a StreamReader[any]: a value is boxed, a
+	// live stream is teed directly. Its elem type drives the re-stamp on every
+	// target carrier (copyReader erases it to chan copyItem[any]).
+	var src StreamReader[any]
+	var elemT reflect.Type
+	if in.isStream {
+		live.unregister(in.stream) // ownership moves to the broadcaster
+		src = in.stream
+		elemT = in.elemT
+	} else {
+		src = box(in.value)
+		elemT = ck.copyElemT() // declared T (the boxed value's type)
+	}
+
+	// Tee. The broadcaster takes ownership of src (defer src.Close()).
+	readers := Copy[any](src, n)
+	for _, rd := range readers {
+		live.register(rd) // EVERY copyReader registered independently (mandatory)
+	}
+
+	// Identify the single tail target (its subtree reaches the exit).
+	tailIdx := -1
+	for i, k := range keys {
+		target, _ := copyNode.chainNext(k)
+		if subtreeReaches(nodeAt, target, plan.exitID) {
+			tailIdx = i
+			break
+		}
+	}
+	if tailIdx < 0 {
+		// No target reaches the exit — the exit is unreachable through this copy.
+		// Drain every reader so the broadcaster releases src, then error.
+		for _, rd := range readers {
+			rd.Close()
+		}
+		return streamCarrier{}, fmt.Errorf("graph: stream: copy %q: no target subtree reaches the exit", copyNode.chainID())
+	}
+
+	// Spawn one goroutine per NON-tail target: each walks its leaf subtree from
+	// its copyReader (re-stamped elemT) to completion, draining/closing whatever
+	// stream it ends on so the broadcaster can advance. We do NOT wait on them:
+	// the tail drives the broadcaster and the leaves finish alongside; the root
+	// ctx + liveSet guarantee teardown on error / early-Close.
+	for i, k := range keys {
+		if i == tailIdx {
+			continue
+		}
+		target, _ := copyNode.chainNext(k)
+		entry := streamCarrier{isStream: true, stream: readers[i], elemT: elemT}
+		go func(target string, entry streamCarrier) {
+			r.driveLeafSubtree(ctx, nodeAt, plan, target, entry, live)
+		}(target, entry)
+	}
+
+	// Walk the TAIL subtree on this goroutine from its copyReader.
+	tailTarget, _ := copyNode.chainNext(keys[tailIdx])
+	tailEntry := streamCarrier{isStream: true, stream: readers[tailIdx], elemT: elemT}
+	carrier, nextCopy, err := walkChain(ctx, nodeAt, tailTarget, tailEntry, live)
+	if err != nil {
+		return streamCarrier{}, err
+	}
+	if nextCopy != nil {
+		// Nested Copy on the tail path: recurse.
+		return r.fanOutCopy(ctx, nodeAt, plan, nextCopy, carrier, live)
+	}
+	return carrier, nil
+}
+
+// driveLeafSubtree walks a non-tail Copy target subtree to completion and
+// discards its result, draining/closing any stream it ends on so the Copy
+// broadcaster is not wedged waiting on this consumer. A nested Copy in the leaf
+// recurses (its own tail leaf is drained here). Errors are swallowed: a leaf is
+// not the graph output, and the root ctx + liveSet handle teardown; the leaf's
+// streams are registered in live so a later closeAll releases them regardless.
+func (r *Runnable[I, O]) driveLeafSubtree(ctx context.Context, nodeAt func(string) chainNode, plan *streamGraphPlan, startID string, entry streamCarrier, live *liveSet) {
+	carrier, nextCopy, err := walkChain(ctx, nodeAt, startID, entry, live)
+	if err != nil {
+		return
+	}
+	if nextCopy != nil {
+		// Nested copy in a leaf: fan it out too. Its tail carrier is itself a
+		// leaf here — drain it.
+		carrier, err = r.fanOutCopy(ctx, nodeAt, plan, nextCopy, carrier, live)
+		if err != nil {
+			return
+		}
+	}
+	// Drain/close whatever the leaf ended on so the broadcaster can complete.
+	if carrier.isStream && carrier.stream != nil {
+		for {
+			if _, err := carrier.stream.Next(); err != nil {
+				break
+			}
+		}
+		carrier.stream.Close()
+		live.unregister(carrier.stream)
+	}
+}
+
+// subtreeReaches reports whether the exit id is statically reachable from
+// startID by following every node's forward edges (all ports). Used to pick the
+// single Copy target subtree that produces the graph tail.
+func subtreeReaches(nodeAt func(string) chainNode, startID, exitID string) bool {
+	seen := map[string]bool{}
+	var dfs func(id string) bool
+	dfs = func(id string) bool {
+		if id == exitID {
+			return true
+		}
+		if seen[id] {
+			return false
+		}
+		seen[id] = true
+		pn := nodeAt(id)
+		if pn == nil {
+			return false
+		}
+		for _, t := range pn.chainTargets() {
+			if dfs(t) {
+				return true
+			}
+		}
+		return false
+	}
+	return dfs(startID)
+}
+
+// materialiseTail turns the root walk's final carrier into a StreamReader[O],
+// exactly like runStreamDAG / runLinearStream do at the tail: a stream folds to
+// O via the registered concatenator (lazily, so Close-before-Next releases the
+// upstream), a value is boxed. The tail stream's ownership moves to the
+// returned reader, so it is unregistered from live.
+func (r *Runnable[I, O]) materialiseTail(carrier streamCarrier, live *liveSet) (StreamReader[O], error) {
+	if carrier.isStream {
+		live.unregister(carrier.stream)
+		fold, ok := lookupConcat(r.outT)
+		if !ok {
+			carrier.stream.Close()
+			return nil, fmt.Errorf("graph: stream: no Concatenator for tail output %s", r.outT)
+		}
+		return foldTail[O](carrier.stream, fold), nil
+	}
+	typed, ok := carrier.value.(O)
+	if !ok {
+		return nil, fmt.Errorf("graph: stream: tail output is %T, not assignable to %s", carrier.value, r.outT)
+	}
+	return box(typed), nil
+}
+
+// streamGraphReader wraps the tail reader so the consumer's Close cancels the
+// root ctx (stopping every subtree goroutine + the Copy broadcaster) and Closes
+// every still-live stream in the set. Next delegates to the inner tail reader.
+type streamGraphReader[O any] struct {
+	inner    StreamReader[O]
+	cancel   context.CancelFunc
+	live     *liveSet
+	closeOne sync.Once
+}
+
+func (s *streamGraphReader[O]) Next() (O, error) { return s.inner.Next() }
+
+func (s *streamGraphReader[O]) Close() error {
+	err := s.inner.Close()
+	s.closeOne.Do(func() {
+		s.cancel()
+		s.live.closeAll()
+	})
+	return err
 }
 
 // streamEmittingNodes returns the set of node ids that may emit a raw data

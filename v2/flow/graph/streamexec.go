@@ -1,5 +1,7 @@
 package graph
 
+import "sync"
+
 // streamexec.go holds shared data-stream execution helpers used by BOTH the
 // linear executor (runLinearStream) and the branch-DAG executor
 // (runStreamDAG). It NEVER touches the engine, runCore, checkpoints,
@@ -58,4 +60,71 @@ func (l *liveCarrier) closeIfLive() {
 		_ = l.c.stream.Close()
 	}
 	l.clear()
+}
+
+// liveSet tracks EVERY in-flight stream a streaming walk currently owns, so an
+// error return or early-Close before the tail is materialised can release them
+// all. The single-goroutine executors (runStreamDAG, the linear chain) never
+// hold more than one live stream at a time, but the Copy-bearing executor
+// (runStreamGraph) fans out to N concurrent subtree goroutines, each with its
+// own live stream PLUS every copyReader from the Phase-2 broadcaster — so a set,
+// not a single slot, is required.
+//
+// Discipline (mirrors liveCarrier, generalised to N):
+//   - register(c) records a stream after it is produced (streamRun output, a
+//     copyReader, or a broadcaster source we materialised);
+//   - unregister(c) drops it once HANDED OFF (folded into a downstream value, or
+//     materialised into the returned tail) so closeAll does not double-close;
+//   - closeAll() (under a deferred error/early-Close guard) Closes every stream
+//     still registered. ORDER is irrelevant — the Phase-2 two-stage Close drains
+//     each broadcaster/reader independently (round-2 verified leak-free in both
+//     Close orders) — but COMPLETENESS is mandatory: every copyReader is
+//     registered independently so a subtree that errors before consuming its
+//     copyReader cannot wedge the broadcaster.
+//
+// Close is idempotent on every StreamReader, so a redundant close on a racing
+// success path is a harmless no-op.
+type liveSet struct {
+	mu      sync.Mutex
+	streams []StreamReader[any]
+}
+
+// register records s as an in-flight stream the walk now owns. A nil stream is
+// ignored so callers can register a carrier's stream unconditionally.
+func (l *liveSet) register(s StreamReader[any]) {
+	if s == nil {
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.streams = append(l.streams, s)
+}
+
+// unregister drops s (handed off: folded or materialised into the tail) so a
+// later closeAll is a no-op for it. Removal is by pointer identity.
+func (l *liveSet) unregister(s StreamReader[any]) {
+	if s == nil {
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for i, cur := range l.streams {
+		if cur == s {
+			l.streams = append(l.streams[:i], l.streams[i+1:]...)
+			return
+		}
+	}
+}
+
+// closeAll Closes every stream still registered and empties the set. Safe to
+// call more than once (idempotent Close + the set is drained). Intended under a
+// deferred error guard, exactly like liveCarrier.closeIfLive.
+func (l *liveSet) closeAll() {
+	l.mu.Lock()
+	streams := l.streams
+	l.streams = nil
+	l.mu.Unlock()
+	for _, s := range streams {
+		_ = s.Close()
+	}
 }
