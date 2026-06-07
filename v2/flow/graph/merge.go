@@ -376,3 +376,26 @@ func frameValue(raw any) any {
 	}
 	return raw
 }
+
+// tagSource wraps a source's StreamReader[any] so every frame is delivered as a
+// mergeSrcFrame{srcIdx} — the source index the ordered (zip) fold needs to
+// reconstruct per-source lists. The terminal error is forwarded unchanged; Close
+// delegates to the underlying stream.
+func tagSource(src StreamReader[any], srcIdx int) StreamReader[any] {
+	return &taggedSourceReader{src: src, srcIdx: srcIdx}
+}
+
+type taggedSourceReader struct {
+	src    StreamReader[any]
+	srcIdx int
+}
+
+func (t *taggedSourceReader) Next() (any, error) {
+	v, err := t.src.Next()
+	if err != nil {
+		return nil, err
+	}
+	return mergeSrcFrame{srcIdx: t.srcIdx, v: v}, nil
+}
+
+func (t *taggedSourceReader) Close() error { return t.src.Close() }

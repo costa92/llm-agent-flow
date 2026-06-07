@@ -222,12 +222,14 @@ func (g *Graph[I, O]) buildStreamPlan() (*streamPlan, error) {
 // type (branch-DAG streamPlanNode or Copy-DAG streamGraphNode) without a second
 // copy of the node-step loop. streamPlanNode has no Copy node, so asCopy is
 // always nil for it.
-func (n *streamPlanNode) chainID() string          { return n.id }
-func (n *streamPlanNode) chainKind() flow.NodeKind { return n.kind }
-func (n *streamPlanNode) chainStream() streamNode  { return n.stream }
-func (n *streamPlanNode) chainBranch() bool        { return n.branch }
-func (n *streamPlanNode) chainInT() reflect.Type   { return n.inT }
-func (n *streamPlanNode) chainCopy() copyKind      { return nil }
+func (n *streamPlanNode) chainID() string             { return n.id }
+func (n *streamPlanNode) chainKind() flow.NodeKind    { return n.kind }
+func (n *streamPlanNode) chainStream() streamNode     { return n.stream }
+func (n *streamPlanNode) chainBranch() bool           { return n.branch }
+func (n *streamPlanNode) chainInT() reflect.Type      { return n.inT }
+func (n *streamPlanNode) chainCopy() copyKind         { return nil }
+func (n *streamPlanNode) chainMerge() mergeKind       { return nil }
+func (n *streamPlanNode) chainSources() []mergeSource { return nil }
 func (n *streamPlanNode) chainNext(port string) (string, bool) {
 	t, ok := n.out[port]
 	return t, ok
