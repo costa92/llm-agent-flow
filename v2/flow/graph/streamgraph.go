@@ -27,20 +27,34 @@ type streamGraphPlan struct {
 }
 
 // streamGraphNode is one node in a stream-graph plan: its prebuilt adapter, the
-// optional streamNode / copy / branch capability flags, declared types, and its
-// outgoing edges keyed by the source-port name (portOut for ordinary nodes;
-// route-key ports for a branch; target-key ports for a copy).
+// optional streamNode / copy / merge / branch capability flags, declared types,
+// and its outgoing edges keyed by the source-port name (portOut for ordinary
+// nodes; route-key ports for a branch; target-key ports for a copy).
 type streamGraphNode struct {
 	id     string
 	kind   flow.NodeKind
 	stream streamNode // non-nil iff kind implements streamNode
 	copy   copyKind   // non-nil iff kind is a *copyAdapter[...]
+	merge  mergeKind  // non-nil iff kind is a streaming merge / zip node
 	branch bool       // true iff kind is a branch
 	inT    reflect.Type
 	outT   reflect.Type
 	// out maps a source-port name to the single target node id reachable from
-	// that port. portOut for ordinary nodes; target-key ports for a copy.
+	// that port. portOut for ordinary nodes; target-key ports for a copy. A
+	// merge node has a single portOut edge to its continuation.
 	out map[string]string
+	// sources lists the INBOUND source-key edges of a merge node (sorted by
+	// key); empty for every non-merge node. It is the fan-in dual of out: the
+	// executor walks each source's subtree and interleaves them.
+	sources []mergeSource
+}
+
+// mergeSource is one inbound edge of a merge node: the source-key port and the
+// id of the node feeding it. fanInMerge walks each source's subtree (from the
+// graph entry value) to a stream and interleaves them in sorted-key order.
+type mergeSource struct {
+	key   string
+	srcID string
 }
 
 // buildStreamGraphPlan analyses the graph for the Copy-bearing streamable-DAG
@@ -62,15 +76,19 @@ func (g *Graph[I, O]) buildStreamGraphPlan() (*streamGraphPlan, error) {
 	}
 	byID := make(map[string]built, len(g.nodes))
 	hasCopy := false
+	hasMerge := false
+	mergeIDs := make(map[string]mergeKind) // merge node id -> its capability
 	for _, n := range g.nodes {
 		kind := n.newKind()
-		// Whitelist: streamNode (chatModel), copy fan-out, branch, or a value
-		// node (lambda/template/tool/passthrough). Anything else → degrade.
+		// Whitelist: streamNode (chatModel), copy fan-out, merge fan-in, branch,
+		// or a value node (lambda/template/tool/passthrough). Anything else →
+		// degrade.
 		_, isStream := kind.(streamNode)
 		_, isCopy := kind.(copyKind)
+		mk, isMerge := kind.(mergeKind)
 		_, isBranch := kind.(branchKind)
 		switch {
-		case isStream, isCopy, isBranch:
+		case isStream, isCopy, isMerge, isBranch:
 		default:
 			if !isValueNode(kind) {
 				return nil, nil // unknown / non-whitelisted kind → degrade
@@ -79,29 +97,47 @@ func (g *Graph[I, O]) buildStreamGraphPlan() (*streamGraphPlan, error) {
 		if isCopy {
 			hasCopy = true
 		}
+		if isMerge {
+			hasMerge = true
+			mergeIDs[n.ref.id] = mk
+		}
 		byID[n.ref.id] = built{gn: n, kind: kind}
 	}
-	// No Copy node → not our shape. buildStreamPlan already had its chance
-	// (linear keeps its pipeline; branch-DAG keeps streamPlan); degrade.
-	if !hasCopy {
+	// Neither a Copy nor a Merge node → not our shape. buildStreamPlan already
+	// had its chance (linear keeps its pipeline; branch-DAG keeps streamPlan);
+	// degrade.
+	if !hasCopy && !hasMerge {
+		return nil, nil
+	}
+	// STANDALONE-only MVP: a graph with BOTH a Copy and a Merge is the deferred
+	// diamond (Copy→{A,B}→Merge). The shipped fanOutCopy single-tail model would
+	// silently discard a merge source (round-2 BLOCKER), so degrade — the diamond
+	// is its own future task. fanInMerge is purely additive only when no Copy is
+	// present.
+	if hasCopy && hasMerge {
 		return nil, nil
 	}
 
-	// Reject fan-in (combine: toPort != portIn) and implicit raw-stream tees (a
-	// single SOURCE PORT feeding >1 edge). A Copy node fans out via DISTINCT
-	// target-key ports (each feeding exactly one edge), so per-port fan-out
-	// stays ≤1; an implicit tee (e.g. a chatmodel out-port feeding 2 edges with
-	// NO AddCopy) violates it and degrades — the explicit-node requirement.
-	portFanout := make(map[string]int) // "node\x00port" -> edge count
+	// Edge rules. Reject implicit raw-stream tees (a single STREAM-emitting source
+	// port feeding >1 edge) and unexpected fan-in. A Copy fans out via DISTINCT
+	// target-key ports; a Merge fans IN via DISTINCT source-key ports. So:
+	//   - an edge into a Merge node on a declared source key is ALLOWED (the only
+	//     legal fan-in); any other toPort != portIn degrades (e.g. AddCombine).
+	//   - a value port may feed >1 edge (safe value replication to N merge
+	//     sources — the entry value is boxed independently per source, no
+	//     broadcaster); but a STREAM-emitting port feeding >1 edge is a raw tee
+	//     and still degrades (the preserved implicit-tee guard).
+	// streamEmittingNodes needs the plan nodes; compute the emitting set after the
+	// adjacency is built, then run the tee guard.
 	for _, e := range g.edges {
 		if e.toPort != portIn {
-			return nil, nil // fan-in (combine) → degrade
-		}
-		portFanout[e.from+"\x00"+e.fromPort]++
-	}
-	for _, cnt := range portFanout {
-		if cnt > 1 {
-			return nil, nil // a source port feeding >1 edge = implicit tee → degrade
+			mk, ok := mergeIDs[e.to]
+			if !ok {
+				return nil, nil // fan-in into a non-merge node (combine) → degrade
+			}
+			if !isMergeSourceKey(mk, e.toPort) {
+				return nil, nil // not a declared merge source key → degrade
+			}
 		}
 	}
 
@@ -115,12 +151,14 @@ func (g *Graph[I, O]) buildStreamGraphPlan() (*streamGraphPlan, error) {
 	for id, b := range byID {
 		sn, _ := b.kind.(streamNode)
 		ck, _ := b.kind.(copyKind)
+		mk, _ := b.kind.(mergeKind)
 		_, isBranch := b.kind.(branchKind)
 		plan.nodes[id] = &streamGraphNode{
 			id:     id,
 			kind:   b.kind,
 			stream: sn,
 			copy:   ck,
+			merge:  mk,
 			branch: isBranch,
 			inT:    b.gn.ref.inT,
 			outT:   b.gn.ref.outT,
@@ -132,7 +170,20 @@ func (g *Graph[I, O]) buildStreamGraphPlan() (*streamGraphPlan, error) {
 		if !ok {
 			return nil, nil // edge from an unknown node → degrade
 		}
+		// A merge inbound edge (from a source -> merge.<key>) is recorded on the
+		// MERGE node's sources, not the source's out (the source's out already
+		// carries its single portOut->merge edge below). The source node's
+		// forward edge to the merge is its portOut edge.
+		if dn, ok := plan.nodes[e.to]; ok && dn.merge != nil && e.toPort != portIn {
+			dn.sources = append(dn.sources, mergeSource{key: e.toPort, srcID: e.from})
+		}
 		pn.out[e.fromPort] = e.to
+	}
+	// Sort each merge node's sources by key for deterministic fan-in order.
+	for _, pn := range plan.nodes {
+		if pn.merge != nil && len(pn.sources) > 1 {
+			sortMergeSources(pn.sources)
+		}
 	}
 
 	// Reachability + single-component + acyclicity from entry (static walk over
@@ -158,6 +209,21 @@ func (g *Graph[I, O]) buildStreamGraphPlan() (*streamGraphPlan, error) {
 			}
 		}
 		delete(stack, id)
+		// A merge node is reached by walking INTO it from N source chains; its
+		// source nodes are otherwise unreachable via out (out is fan-out-only).
+		// Visit each source AFTER popping this merge off the stack so the source's
+		// own out-edge back into this merge is not mis-flagged as a cycle (the
+		// source->merge edge is a real forward edge; the merge->source visit here
+		// is only for single-component coverage). Source chains must themselves be
+		// acyclic, so each is walked with a fresh stack.
+		for _, src := range pn.sources {
+			if _, ok := plan.nodes[src.srcID]; !ok {
+				return errDangling
+			}
+			if err := reaches(src.srcID, map[string]bool{}); err != nil {
+				return err
+			}
+		}
 		return nil
 	}
 	if err := reaches(g.entry.id, map[string]bool{}); err != nil {
@@ -179,11 +245,35 @@ func (g *Graph[I, O]) buildStreamGraphPlan() (*streamGraphPlan, error) {
 	// emits a raw stream downstream (it folds-on-input). We compute the
 	// stream-emitting set by propagating from streamNodes through Copy nodes.
 	emitsStream := g.streamEmittingNodes(plan)
+
+	// Implicit-tee guard (preserved, refined): a STREAM-emitting source port
+	// feeding >1 edge is a raw tee with no broadcaster → degrade. A VALUE port
+	// may fan out (safe value replication to N merge sources). Keying on the
+	// (node, port) pair, only stream-emitting ports are counted.
+	streamPortFanout := make(map[string]int) // "node\x00port" -> edge count
+	for _, e := range g.edges {
+		if emitsStream[e.from] {
+			streamPortFanout[e.from+"\x00"+e.fromPort]++
+		}
+	}
+	for _, cnt := range streamPortFanout {
+		if cnt > 1 {
+			return nil, nil // a stream-emitting port feeding >1 edge = implicit tee → degrade
+		}
+	}
+
+	// Folder validation across the whole DAG (Compile-error escalation). A merge
+	// inbound edge is EXEMPT: the merge node owns its combine→fold bridge, so the
+	// per-source stream is folded by the user combine, not a registered
+	// Concatenator. Every other stream→value boundary needs a folder.
 	for _, e := range g.edges {
 		up := plan.nodes[e.from]
 		down := plan.nodes[e.to]
 		if !emitsStream[up.id] {
 			continue // upstream emits a value, never a stream
+		}
+		if down.merge != nil && e.toPort != portIn {
+			continue // merge source boundary: combine folds it, no Concatenator needed
 		}
 		if _, ok := lookupConcat(down.inT); !ok {
 			return nil, fmt.Errorf("graph: compile: stream edge %q -> %q: no Concatenator for %s",

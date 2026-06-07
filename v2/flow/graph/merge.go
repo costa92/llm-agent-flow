@@ -153,6 +153,25 @@ type mergeKind interface {
 	mergeFold(ctx context.Context, merged StreamReader[any]) (any, error)
 }
 
+// isMergeSourceKey reports whether key is one of mk's declared source-key input
+// ports. The classifier uses it to allow ONLY a merge's declared source keys as
+// fan-in toPorts (every other toPort != portIn degrades).
+func isMergeSourceKey(mk mergeKind, key string) bool {
+	for _, k := range mk.mergeKeys() {
+		if k == key {
+			return true
+		}
+	}
+	return false
+}
+
+// sortMergeSources sorts a merge node's inbound sources by key (insertion sort —
+// the slice is tiny). Deterministic source order is the fan-in dual of the
+// adapter's sorted-key gather, so the stream path and the value path agree.
+func sortMergeSources(s []mergeSource) {
+	sort.Slice(s, func(i, j int) bool { return s[i].key < s[j].key })
+}
+
 // mergeSrcFrame tags one merged frame with the index of the source it came from,
 // so the ordered (zip) fold can reconstruct each source's per-frame list. The
 // unordered fold ignores the index. fanInMerge wraps every source reader so its
