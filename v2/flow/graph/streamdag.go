@@ -218,6 +218,28 @@ func (g *Graph[I, O]) buildStreamPlan() (*streamPlan, error) {
 	return plan, nil
 }
 
+// chainNode accessors let walkChain thread a single chain over EITHER plan-node
+// type (branch-DAG streamPlanNode or Copy-DAG streamGraphNode) without a second
+// copy of the node-step loop. streamPlanNode has no Copy node, so asCopy is
+// always nil for it.
+func (n *streamPlanNode) chainID() string          { return n.id }
+func (n *streamPlanNode) chainKind() flow.NodeKind { return n.kind }
+func (n *streamPlanNode) chainStream() streamNode  { return n.stream }
+func (n *streamPlanNode) chainBranch() bool        { return n.branch }
+func (n *streamPlanNode) chainInT() reflect.Type   { return n.inT }
+func (n *streamPlanNode) chainCopy() copyKind      { return nil }
+func (n *streamPlanNode) chainNext(port string) (string, bool) {
+	t, ok := n.out[port]
+	return t, ok
+}
+func (n *streamPlanNode) chainTargets() []string {
+	ts := make([]string, 0, len(n.out))
+	for _, t := range n.out {
+		ts = append(ts, t)
+	}
+	return ts
+}
+
 // branchKind is the capability a branch node exposes to the stream planner: it
 // reports its declared route-key output ports so the planner/executor can tell
 // a branch apart from a value node. *branchAdapter[T] satisfies it.
@@ -254,94 +276,38 @@ var (
 // live-carrier cleanup, so the error path never leaks.
 func (r *Runnable[I, O]) runStreamDAG(ctx context.Context, in I) (_ StreamReader[O], retErr error) {
 	plan := r.streamPlan
-	carrier := streamCarrier{value: in} // entry input is always a value
+	nodeAt := func(id string) chainNode {
+		pn, ok := plan.nodes[id]
+		if !ok {
+			return nil
+		}
+		return pn
+	}
 
-	var live liveCarrier
+	// Single in-flight stream at any time (the branch DAG walks one route), but
+	// we use the same liveSet helper walkChain registers into, so the error path
+	// releases whatever is live. A branch-DAG plan has NO Copy node, so walkChain
+	// always walks to the sink (stoppedAtCopy == nil).
+	live := &liveSet{}
 	defer func() {
 		if retErr != nil {
-			live.closeIfLive()
+			live.closeAll()
 		}
 	}()
 
-	cur := plan.entryID
-	for {
-		pn := plan.nodes[cur]
-
-		switch {
-		case pn.branch:
-			// Fold any upstream stream to the branch's In type (a value), then
-			// run the branch to select exactly one route, and follow it.
-			if carrier.isStream {
-				live.clear()
-				v, err := concatToValue(carrier, pn.inT)
-				if err != nil {
-					return nil, err
-				}
-				carrier = streamCarrier{value: v}
-			}
-			out, err := pn.kind.Run(ctx, map[string]any{portIn: carrier.value})
-			if err != nil {
-				return nil, err
-			}
-			// branchAdapter.Run emits exactly one {selectedPort: value} entry.
-			selPort, selVal, ok := singleEntry(out)
-			if !ok {
-				return nil, fmt.Errorf("graph: stream: branch %q produced %d outputs, want exactly 1", pn.id, len(out))
-			}
-			target, ok := pn.out[selPort]
-			if !ok {
-				return nil, fmt.Errorf("graph: stream: branch %q selected port %q has no edge", pn.id, selPort)
-			}
-			carrier = streamCarrier{value: selVal}
-			cur = target
-			continue
-
-		case pn.stream != nil:
-			// Stream node: needs a materialised input; fold upstream if needed.
-			if carrier.isStream {
-				live.clear()
-				v, err := concatToValue(carrier, pn.inT)
-				if err != nil {
-					return nil, err
-				}
-				carrier = streamCarrier{value: v}
-			}
-			out, err := pn.stream.streamRun(ctx, carrier)
-			if err != nil {
-				return nil, err
-			}
-			carrier = out
-			live.set(carrier)
-
-		default:
-			// Value node: fold upstream stream to its In type, then Run.
-			if carrier.isStream {
-				live.clear()
-				v, err := concatToValue(carrier, pn.inT)
-				if err != nil {
-					return nil, err
-				}
-				carrier = streamCarrier{value: v}
-			}
-			out, err := pn.kind.Run(ctx, map[string]any{portIn: carrier.value})
-			if err != nil {
-				return nil, err
-			}
-			carrier = streamCarrier{value: out[portOut]}
-		}
-
-		// Advance to the single forward edge (portOut). The exit is a sink.
-		next, ok := pn.out[portOut]
-		if !ok {
-			break // reached the exit (sink)
-		}
-		cur = next
+	carrier, copyNode, err := walkChain(ctx, nodeAt, plan.entryID, streamCarrier{value: in}, live)
+	if err != nil {
+		return nil, err
+	}
+	if copyNode != nil {
+		// Unreachable: buildStreamPlan never whitelists a Copy node into a
+		// streamPlan (a copy makes the graph a streamGraphPlan instead).
+		return nil, fmt.Errorf("graph: stream: branch-DAG plan reached a copy node %q", copyNode.chainID())
 	}
 
 	// The tail materialiser takes ownership of any live stream.
-	live.clear()
-
 	if carrier.isStream {
+		live.unregister(carrier.stream)
 		fold, ok := lookupConcat(plan.outT)
 		if !ok {
 			carrier.stream.Close()
