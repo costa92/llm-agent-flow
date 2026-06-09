@@ -197,6 +197,31 @@ func (e *Engine) resumeWithCell(ctx context.Context, runID, token string, humanI
 		activated[edge.Target.Node] = true
 		edgeStates[i] = EdgeFired
 	}
+	for i, m := range e.flow.Mappings {
+		if m.Source.Node != cp.InterruptNodeID {
+			continue
+		}
+		srcPorts := portValues[m.Source.Node]
+		value, ok := srcPorts[m.Source.Port]
+		if !ok {
+			continue
+		}
+		selected, serr := selectPath(value, m.Source.Path)
+		if serr != nil {
+			return RunResult{}, fmt.Errorf("flow: resume: mapping[%d] %s.%s: %w", i, m.Source.Node, m.Source.Port, serr)
+		}
+		setPort := func(nodeID, port string, v any) {
+			if portValues[nodeID] == nil {
+				portValues[nodeID] = make(map[string]any)
+			}
+			portValues[nodeID][port] = v
+		}
+		getPorts := func(nodeID string) map[string]any { return portValues[nodeID] }
+		if err := setMappedPort(m.Target.Node, m.Target.Port, m.Target.Path, selected, setPort, getPorts); err != nil {
+			return RunResult{}, fmt.Errorf("flow: resume: mapping[%d] target %s.%s: %w", i, m.Target.Node, m.Target.Port, err)
+		}
+		activated[m.Target.Node] = true
+	}
 
 	out, susp, err := e.runCore(ctx, nil, nil, runID, true, &resumeSeed{
 		activated:  activated,

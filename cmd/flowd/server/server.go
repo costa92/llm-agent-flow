@@ -115,6 +115,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /flows", s.handleCreateFlow)
 	mux.HandleFunc("GET /flows", s.handleListFlows)
 	mux.HandleFunc("GET /flows/{id}", s.handleGetFlow)
+	mux.HandleFunc("GET /flows/{id}/debug", s.handleDebugFlow)
 	mux.HandleFunc("PUT /flows/{id}", s.handlePutFlow)
 	mux.HandleFunc("DELETE /flows/{id}", s.handleDeleteFlow)
 
@@ -123,6 +124,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /flows/{id}/runs", s.handleListRunsForFlow)
 
 	mux.HandleFunc("GET /runs/{id}", s.handleGetRun)
+	mux.HandleFunc("GET /runs/{id}/debug", s.handleDebugRun)
 	mux.HandleFunc("GET /runs/{id}/events", s.handleListRunEvents)
 	mux.HandleFunc("POST /runs/{id}/replay", s.handleReplayRun)
 
@@ -377,6 +379,32 @@ func (s *Server) handleGetFlow(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, rec)
 }
 
+func (s *Server) handleDebugFlow(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	rec, err := s.cfg.Store.GetFlow(r.Context(), id)
+	if errors.Is(err, flowstore.ErrNotFound) {
+		writeError(w, http.StatusNotFound, fmt.Errorf("flow %q not found", id))
+		return
+	}
+	if err != nil {
+		s.cfg.Logger.Printf("flowd: GET /flows/%s/debug: %v", id, err)
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	var f flow.Flow
+	if err := json.Unmarshal(rec.JSON, &f); err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Errorf("decode stored flow: %w", err))
+		return
+	}
+	runs, err := s.cfg.Store.ListRuns(r.Context(), id, 10)
+	if err != nil {
+		s.cfg.Logger.Printf("flowd: GET /flows/%s/debug runs: %v", id, err)
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, debugViewFromFlow(rec, f, runs))
+}
+
 func (s *Server) handleDeleteFlow(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if err := s.cfg.Store.DeleteFlow(r.Context(), id); err != nil {
@@ -625,6 +653,27 @@ func (s *Server) handleGetRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, rec)
+}
+
+func (s *Server) handleDebugRun(w http.ResponseWriter, r *http.Request) {
+	runID := r.PathValue("id")
+	rec, err := s.cfg.Store.GetRun(r.Context(), runID)
+	if errors.Is(err, flowstore.ErrNotFound) {
+		writeError(w, http.StatusNotFound, fmt.Errorf("run %q not found", runID))
+		return
+	}
+	if err != nil {
+		s.cfg.Logger.Printf("flowd: GET /runs/%s/debug: %v", runID, err)
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	events, err := s.cfg.Store.ListRunEvents(r.Context(), runID, 0)
+	if err != nil {
+		s.cfg.Logger.Printf("flowd: GET /runs/%s/debug events: %v", runID, err)
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, debugViewFromRun(rec, events))
 }
 
 // handleReplayRun re-streams a run's persisted events as a fresh SSE
@@ -906,7 +955,6 @@ func statusForResumeError(err error) int {
 		return http.StatusInternalServerError
 	}
 }
-
 
 // streamPayloadV2 renders a v2 Event into the map payload shape persisted
 // + emitted as SSE. Mirrors the v0.1 streamPayload but covers the HITL
