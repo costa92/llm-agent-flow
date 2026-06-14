@@ -28,8 +28,8 @@ func (e *ValidateError) Error() string {
 //   - non-empty node list
 //   - unique node IDs
 //   - non-empty node IDs and types
-//   - no self-loop edges (Source.Node == Target.Node)
-//   - every Edge references an existing node
+//   - no self-loop edges/mappings (Source.Node == Target.Node)
+//   - every Edge/Mapping references an existing node
 //   - no duplicate edges (same source/target pair)
 //   - no cycles in the directed node graph
 func Validate(f Flow) error {
@@ -83,6 +83,47 @@ func Validate(f Flow) error {
 		}
 	}
 
+	for i, m := range f.Mappings {
+		inputSource := m.Source.Input != ""
+		nodeSource := m.Source.Node != "" || m.Source.Port != ""
+		switch {
+		case inputSource && nodeSource:
+			issues = append(issues, fmt.Sprintf("mappings[%d]: source must use either input or node port, not both", i))
+		case !inputSource && !nodeSource:
+			issues = append(issues, fmt.Sprintf("mappings[%d]: source is empty", i))
+		case nodeSource:
+			if m.Source.Node == "" {
+				issues = append(issues, fmt.Sprintf("mappings[%d]: source node is empty", i))
+			} else if _, ok := ids[m.Source.Node]; !ok {
+				issues = append(issues, fmt.Sprintf("mappings[%d]: source node %q not found", i, m.Source.Node))
+			}
+			if m.Source.Port == "" {
+				issues = append(issues, fmt.Sprintf("mappings[%d]: source port is empty", i))
+			}
+		}
+		if m.Target.Node == "" {
+			issues = append(issues, fmt.Sprintf("mappings[%d]: target node is empty", i))
+		} else if _, ok := ids[m.Target.Node]; !ok {
+			issues = append(issues, fmt.Sprintf("mappings[%d]: target node %q not found", i, m.Target.Node))
+		}
+		if m.Target.Port == "" {
+			issues = append(issues, fmt.Sprintf("mappings[%d]: target port is empty", i))
+		}
+		for j, seg := range m.Source.Path {
+			if seg == "" {
+				issues = append(issues, fmt.Sprintf("mappings[%d]: source path[%d] is empty", i, j))
+			}
+		}
+		for j, seg := range m.Target.Path {
+			if seg == "" {
+				issues = append(issues, fmt.Sprintf("mappings[%d]: target path[%d] is empty", i, j))
+			}
+		}
+		if m.Source.Node != "" && m.Source.Node == m.Target.Node {
+			issues = append(issues, fmt.Sprintf("mappings[%d]: self-loop on node %q", i, m.Source.Node))
+		}
+	}
+
 	if cycle := findCycle(f); len(cycle) > 0 {
 		issues = append(issues, fmt.Sprintf("cycle detected: %v", cycle))
 	}
@@ -109,6 +150,11 @@ func findCycle(f Flow) []string {
 	out := make(map[string][]string, len(f.Nodes))
 	for _, e := range f.Edges {
 		out[e.Source.Node] = append(out[e.Source.Node], e.Target.Node)
+	}
+	for _, m := range f.Mappings {
+		if m.Source.Node != "" {
+			out[m.Source.Node] = append(out[m.Source.Node], m.Target.Node)
+		}
 	}
 	var parent = make(map[string]string)
 	var cycle []string

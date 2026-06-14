@@ -21,6 +21,7 @@ type Flow struct {
 	Description string         `json:"description,omitempty"`
 	Nodes       []Node         `json:"nodes"`
 	Edges       []Edge         `json:"edges"`
+	Mappings    []Mapping      `json:"mappings,omitempty"`
 	Inputs      []NamedPortRef `json:"inputs,omitempty"`
 	Outputs     []NamedPortRef `json:"outputs,omitempty"`
 }
@@ -46,6 +47,31 @@ type Edge struct {
 	Source    PortRef `json:"source"`
 	Target    PortRef `json:"target"`
 	Condition string  `json:"condition,omitempty"`
+}
+
+// Mapping copies a selected value from either a caller input or a node output
+// port into a target node input port. When Target.Path is set, multiple
+// mappings can assemble one structured input object without a glue node.
+type Mapping struct {
+	Source MappingSource `json:"source"`
+	Target MappingTarget `json:"target"`
+}
+
+// MappingSource selects either an external Flow input (Input) or a node port
+// (Node+Port). Path selects a nested field inside that source value.
+type MappingSource struct {
+	Input string   `json:"input,omitempty"`
+	Node  string   `json:"node,omitempty"`
+	Port  string   `json:"port,omitempty"`
+	Path  []string `json:"path,omitempty"`
+}
+
+// MappingTarget names the destination node input port. Path, when non-empty,
+// writes into a nested map rooted at that port.
+type MappingTarget struct {
+	Node string   `json:"node"`
+	Port string   `json:"port"`
+	Path []string `json:"path,omitempty"`
 }
 
 // PortRef names a (Node, Port) pair. Port is the port-name string

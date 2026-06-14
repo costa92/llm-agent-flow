@@ -49,9 +49,20 @@ func structuralHash(f Flow, nodes map[string]NodeKind) (string, error) {
 		TargetPort string `json:"target_port"`
 		Condition  string `json:"condition"`
 	}
+	type mappingDesc struct {
+		Index      int      `json:"index"`
+		SourceIn   string   `json:"source_input,omitempty"`
+		SourceNode string   `json:"source_node,omitempty"`
+		SourcePort string   `json:"source_port,omitempty"`
+		SourcePath []string `json:"source_path,omitempty"`
+		TargetNode string   `json:"target_node"`
+		TargetPort string   `json:"target_port"`
+		TargetPath []string `json:"target_path,omitempty"`
+	}
 	type descriptor struct {
-		Nodes []nodeDesc `json:"nodes"`
-		Edges []edgeDesc `json:"edges"`
+		Nodes    []nodeDesc    `json:"nodes"`
+		Edges    []edgeDesc    `json:"edges"`
+		Mappings []mappingDesc `json:"mappings,omitempty"`
 	}
 
 	portNames := func(ports []Port) []portDesc {
@@ -102,8 +113,21 @@ func structuralHash(f Flow, nodes map[string]NodeKind) (string, error) {
 			Condition:  e.Condition,
 		})
 	}
+	maps := make([]mappingDesc, 0, len(f.Mappings))
+	for i, m := range f.Mappings {
+		maps = append(maps, mappingDesc{
+			Index:      i,
+			SourceIn:   m.Source.Input,
+			SourceNode: m.Source.Node,
+			SourcePort: m.Source.Port,
+			SourcePath: append([]string(nil), m.Source.Path...),
+			TargetNode: m.Target.Node,
+			TargetPort: m.Target.Port,
+			TargetPath: append([]string(nil), m.Target.Path...),
+		})
+	}
 
-	b, err := json.Marshal(descriptor{Nodes: nds, Edges: eds})
+	b, err := json.Marshal(descriptor{Nodes: nds, Edges: eds, Mappings: maps})
 	if err != nil {
 		return "", fmt.Errorf("flow: structural hash: marshal descriptor: %w", err)
 	}

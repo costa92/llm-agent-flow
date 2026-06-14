@@ -48,6 +48,7 @@ func NewRunID() string
 method (*NodeRegistry) Build(n Node, deps Deps) (NodeKind, error)
 method (*NodeRegistry) Register(typ string, fac NodeFactory) error
 func RegisterCodec[T any](name string)
+func RunEventFromFlowEvent(ev Event) contractagents.RunEvent
 func SetState[S any](ctx context.Context, s S)
 func StateFromContext[S any](ctx context.Context) (S, bool)
 func Validate(f Flow) error
@@ -114,6 +115,7 @@ type Flow struct
 	field Edges []Edge
 	field ID string
 	field Inputs []NamedPortRef
+	field Mappings []Mapping
 	field Name string
 	field Nodes []Node
 	field Outputs []NamedPortRef
@@ -126,6 +128,18 @@ type InterruptRequest struct
 	field Kind string
 	field Prompt string
 	field Schema json.RawMessage
+type Mapping struct
+	field Source MappingSource
+	field Target MappingTarget
+type MappingSource struct
+	field Input string
+	field Node string
+	field Path []string
+	field Port string
+type MappingTarget struct
+	field Node string
+	field Path []string
+	field Port string
 type MemoryCheckpointStore struct
 type NamedPortRef struct
 	field Name string

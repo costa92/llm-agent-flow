@@ -30,9 +30,10 @@ import (
 type Engine struct {
 	flow   Flow
 	deps   Deps
-	nodes  map[string]NodeKind // resolved node runtime
-	layers [][]string          // topological layers (node IDs)
-	preds  map[string][]Edge   // incoming edges per node
+	nodes  map[string]NodeKind  // resolved node runtime
+	layers [][]string           // topological layers (node IDs)
+	preds  map[string][]Edge    // incoming edges per node
+	mpreds map[string][]Mapping // incoming mappings per node
 
 	// edgeCond[edgeIndexInFlow] is the precompiled guard for that edge,
 	// or nil for an unconditional edge. Indexed by position in
@@ -123,6 +124,7 @@ func Compile(f Flow, reg *NodeRegistry, deps Deps, opts ...EngineOption) (*Engin
 	}
 
 	preds := make(map[string][]Edge, len(f.Nodes))
+	mpreds := make(map[string][]Mapping, len(f.Nodes))
 	indeg := make(map[string]int, len(f.Nodes))
 	out := make(map[string][]string, len(f.Nodes))
 	for _, n := range f.Nodes {
@@ -132,6 +134,13 @@ func Compile(f Flow, reg *NodeRegistry, deps Deps, opts ...EngineOption) (*Engin
 		preds[e.Target.Node] = append(preds[e.Target.Node], e)
 		out[e.Source.Node] = append(out[e.Source.Node], e.Target.Node)
 		indeg[e.Target.Node]++
+	}
+	for _, m := range f.Mappings {
+		mpreds[m.Target.Node] = append(mpreds[m.Target.Node], m)
+		if m.Source.Node != "" {
+			out[m.Source.Node] = append(out[m.Source.Node], m.Target.Node)
+			indeg[m.Target.Node]++
+		}
 	}
 	var layers [][]string
 	queue := make([]string, 0)
@@ -207,6 +216,7 @@ func Compile(f Flow, reg *NodeRegistry, deps Deps, opts ...EngineOption) (*Engin
 		nodes:              nodes,
 		layers:             layers,
 		preds:              preds,
+		mpreds:             mpreds,
 		edgeCond:           edgeCond,
 		maxNodeConcurrency: cfg.maxNodeConcurrency,
 		checkpointStore:    cfg.checkpointStore,
@@ -326,7 +336,7 @@ func (e *Engine) runCore(ctx context.Context, inputs map[string]any, ch chan<- E
 		// Fresh run.
 		emit(Event{Kind: FlowStarted, FlowID: e.flow.ID})
 		for _, n := range e.flow.Nodes {
-			if len(e.preds[n.ID]) == 0 {
+			if len(e.preds[n.ID]) == 0 && len(e.mpreds[n.ID]) == 0 {
 				activated[n.ID] = true
 			}
 		}
@@ -342,6 +352,10 @@ func (e *Engine) runCore(ctx context.Context, inputs map[string]any, ch chan<- E
 			}
 			setPort(ref.Node, ref.Port, v)
 			activated[ref.Node] = true
+		}
+		if err := e.applyInputMappings(inputs, setPort, getPorts, activated); err != nil {
+			emit(Event{Kind: FlowErr, Err: err})
+			return nil, nil, err
 		}
 		edgeStates = make([]EdgeFireState, len(e.flow.Edges))
 		startLayer = 0
@@ -429,6 +443,36 @@ func (e *Engine) runCore(ctx context.Context, inputs map[string]any, ch chan<- E
 				setPort(edge.Target.Node, edge.Target.Port, value)
 				activated[edge.Target.Node] = true
 				edgeStates[i] = EdgeFired
+			}
+		}
+		return nil
+	}
+
+	fireLayerMappings := func(layer []string, interruptNodeID string) error {
+		for _, srcID := range layer {
+			if interruptNodeID != "" && srcID == interruptNodeID {
+				continue
+			}
+			if !activated[srcID] {
+				continue
+			}
+			srcPorts := getPorts(srcID)
+			for i, m := range e.flow.Mappings {
+				if m.Source.Node != srcID {
+					continue
+				}
+				raw, ok := srcPorts[m.Source.Port]
+				if !ok {
+					continue
+				}
+				value, err := selectPath(raw, m.Source.Path)
+				if err != nil {
+					return fmt.Errorf("flow: run: mapping[%d] %s.%s: %w", i, m.Source.Node, m.Source.Port, err)
+				}
+				if err := setMappedPort(m.Target.Node, m.Target.Port, m.Target.Path, value, setPort, getPorts); err != nil {
+					return fmt.Errorf("flow: run: mapping[%d] target %s.%s: %w", i, m.Target.Node, m.Target.Port, err)
+				}
+				activated[m.Target.Node] = true
 			}
 		}
 		return nil
@@ -543,6 +587,10 @@ func (e *Engine) runCore(ctx context.Context, inputs map[string]any, ch chan<- E
 					emit(Event{Kind: FlowErr, Err: err})
 					return nil, nil, err // sibling cond eval error → no checkpoint
 				}
+				if err := fireLayerMappings(layer, pend[0].nodeID); err != nil {
+					emit(Event{Kind: FlowErr, Err: err})
+					return nil, nil, err
+				}
 				cp, err := e.snapshotCheckpoint(runID, layerIdx, pend[0], activated, portValues, edgeStates, inputs, cell)
 				if err != nil {
 					emit(Event{Kind: FlowErr, Err: err})
@@ -562,6 +610,10 @@ func (e *Engine) runCore(ctx context.Context, inputs map[string]any, ch chan<- E
 		// node in this layer. An edge fires iff its source is activated
 		// AND its Condition (if any) returns true.
 		if err := fireLayerEdges(layer, ""); err != nil {
+			emit(Event{Kind: FlowErr, Err: err})
+			return nil, nil, err
+		}
+		if err := fireLayerMappings(layer, ""); err != nil {
 			emit(Event{Kind: FlowErr, Err: err})
 			return nil, nil, err
 		}
