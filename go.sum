@@ -4,8 +4,8 @@ github.com/antlr4-go/antlr/v4 v4.13.1 h1:SqQKkuVZ+zWkMMNkjy5FZe5mr5WURWnlpmOuzYW
 github.com/antlr4-go/antlr/v4 v4.13.1/go.mod h1:GKmUxMtwp6ZgGwZSva4eWPC5mS6vUAmOABFgjdkM7Nw=
 github.com/costa92/llm-agent v0.9.0 h1:A0xpymao707gmuUdTPTvqBWV28Vf0G6lGDFhR4EEP5k=
 github.com/costa92/llm-agent v0.9.0/go.mod h1:JMQn+s7OUC/+opLQosFNPhpZnxRTpiVBOXvRfIeUwAE=
-github.com/costa92/llm-agent-contract v0.5.0 h1:aSAYsImVvJLRJ8+6Y/fSUFdafHq+mfvhfKw+WDW3TIU=
-github.com/costa92/llm-agent-contract v0.5.0/go.mod h1:8pbOX+wp/O2NCV8P6x+4bShM3n/ibsdyMiNHkolfOME=
+github.com/costa92/llm-agent-contract v0.6.0 h1:PoAXHj4Gx7CF7ys3RE/KOABA9wE37AgSKDGJMHjUWak=
+github.com/costa92/llm-agent-contract v0.6.0/go.mod h1:8pbOX+wp/O2NCV8P6x+4bShM3n/ibsdyMiNHkolfOME=
 github.com/dustin/go-humanize v1.0.1 h1:GzkhY7T5VNhEkwH0PVJgjz+fX1rhBrR7pRT3mDkpeCY=
 github.com/dustin/go-humanize v1.0.1/go.mod h1:Mu1zIs6XwVuF/gI1OepvI0qD18qycQx+mFykh5fBlto=
 github.com/google/cel-go v0.28.1 h1:YWIwi77J4xIsYUwAF/iIuS6haffzIHS8yWI8glSbLWM=
